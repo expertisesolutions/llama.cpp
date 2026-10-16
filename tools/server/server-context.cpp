@@ -1,3 +1,4 @@
+#include "../../src/llama-file-sync.h"
 #include "server-context.h"
 #include <atomic>
 #include <thread>
@@ -2838,13 +2839,15 @@ private:
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }
 
-    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
-        ofs.write((const char *) src, size);
+    static void ckpt_write(FILE * ofs, const void * src, size_t size, size_t & n_written) {
+        if (size && std::fwrite(src, 1, size, ofs) != size) {
+            throw std::runtime_error("failed to write context checkpoint appendix");
+        }
         n_written += size;
     }
 
     template <typename A>
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t, A> & buf, size_t & n_written) {
+    static void ckpt_write_buf(FILE * ofs, const std::vector<uint8_t, A> & buf, size_t & n_written) {
         const uint64_t n = buf.size();
         ckpt_write(ofs, &n, sizeof(n), n_written);
         if (n > 0) {
@@ -2861,11 +2864,11 @@ private:
         if (slot.prompt.checkpoints.empty()) {
             return true;
         }
-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
-        if (!ofs) {
-            SLT_WRN(slot, "failed to append context checkpoints to '%s'\n", filepath.c_str());
-            return false;
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(filepath.c_str(), "ab"), &std::fclose);
+        if (!file) {
+            throw std::runtime_error("failed to open context checkpoint appendix");
         }
+        FILE * ofs = file.get();
         const uint32_t magic   = SLOT_CKPT_MAGIC;
         const uint32_t version = SLOT_CKPT_VERSION;
         const uint32_t count   = (uint32_t) slot.prompt.checkpoints.size();
@@ -2882,12 +2885,7 @@ private:
             ckpt_write_buf(ofs, cur.data_spec, n_written);
             info.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_written - n_start });
         }
-        ofs.flush();
-        if (!ofs) {
-            SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
-            info.clear();
-            return false;
-        }
+        llama_file_sync_close(file.release());
         SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
                 count, (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
@@ -2977,22 +2975,18 @@ private:
         if (data_dft.empty() && data_spec.empty()) {
             return true;
         }
-        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
-        if (!ofs) {
-            SLT_WRN(slot, "failed to append the draft state to '%s'\n", filepath.c_str());
-            return false;
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(filepath.c_str(), "ab"), &std::fclose);
+        if (!file) {
+            throw std::runtime_error("failed to open draft state appendix");
         }
+        FILE * ofs = file.get();
         const uint32_t magic   = SLOT_DRAFT_MAGIC;
         const uint32_t version = SLOT_DRAFT_VERSION;
         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write_buf(ofs, data_dft,  n_written);
         ckpt_write_buf(ofs, data_spec, n_written);
-        ofs.flush();
-        if (!ofs) {
-            SLT_WRN(slot, "failed to append the draft state to '%s' - the draft state is incomplete\n", filepath.c_str());
-            return false;
-        }
+        llama_file_sync_close(file.release());
         SLT_INF(slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
     }
@@ -3273,14 +3267,18 @@ private:
 
                     size_t nwrite_ckpt = 0;
                     std::vector<server_slot_ckpt_info> ckpt_info;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite, nwrite_ckpt, ckpt_info)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
                     size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                    try {
+                        if (!save_slot_checkpoints(filepath, *slot, nwrite, nwrite_ckpt, ckpt_info)) {
+                            send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+                            send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                    } catch (const std::exception & err) {
+                        send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_SERVER);
                         break;
                     }
 
