@@ -2853,8 +2853,11 @@ private:
     }
 
     // returns false if the appendix could not be written completely
-    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t & n_written) const {
+    // offset is the file size before the append, it is used to report absolute record offsets in info
+    bool save_slot_checkpoints(const std::string & filepath, const server_slot & slot, size_t offset, size_t & n_written,
+                               std::vector<server_slot_ckpt_info> & info) const {
         n_written = 0;
+        info.clear();
         if (slot.prompt.checkpoints.empty()) {
             return true;
         }
@@ -2870,16 +2873,19 @@ private:
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
         for (const auto & cur : slot.prompt.checkpoints) {
+            const size_t n_start = n_written;
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
             ckpt_write_buf(ofs, cur.data_tgt,  n_written);
             ckpt_write_buf(ofs, cur.data_dft,  n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
+            info.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_written - n_start });
         }
         ofs.flush();
         if (!ofs) {
             SLT_WRN(slot, "failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
+            info.clear();
             return false;
         }
         SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
@@ -2888,7 +2894,9 @@ private:
     }
 
     // returns the number of bytes consumed, 0 if there is no usable appendix
-    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot) const {
+    size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot,
+                                 std::vector<server_slot_ckpt_info> & info) const {
+        info.clear();
         std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
         const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
         if (!ifs || file_size < offset || !ifs.seekg(offset)) {
@@ -2908,9 +2916,11 @@ private:
             return 0;
         }
         std::list<common_prompt_checkpoint> checkpoints;
+        std::vector<server_slot_ckpt_info> infos;
         for (uint32_t i = 0; i < count; ++i) {
             common_prompt_checkpoint cur;
             cur.id_task = -1; // not created by a task - marks a checkpoint restored from a slot file
+            const size_t n_start = n_read;
             if (!ckpt_read(ifs, &cur.n_tokens, sizeof(cur.n_tokens), n_read) ||
                 !ckpt_read(ifs, &cur.pos_min,  sizeof(cur.pos_min),  n_read) ||
                 !ckpt_read(ifs, &cur.pos_max,  sizeof(cur.pos_max),  n_read) ||
@@ -2925,9 +2935,11 @@ private:
                 SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
             }
+            infos.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_read - n_start });
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
                 checkpoints.pop_front();
+                infos.erase(infos.begin());
             }
         }
         // the slot file does not check the draft context - test-load one draft checkpoint, drop the draft data if it does not fit
@@ -2942,6 +2954,7 @@ private:
             }
         }
         slot.prompt.checkpoints = std::move(checkpoints);
+        info = std::move(infos);
         SLT_INF(slot, "restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
         return n_read;
     }
@@ -3259,7 +3272,8 @@ private:
                     }
 
                     size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                    std::vector<server_slot_ckpt_info> ckpt_info;
+                    if (!save_slot_checkpoints(filepath, *slot, nwrite, nwrite_ckpt, ckpt_info)) {
                         send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -3280,6 +3294,8 @@ private:
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_state_bytes = nwrite;
+                    res->checkpoints   = std::move(ckpt_info);
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3338,7 +3354,8 @@ private:
                     }
 
                     // nread is the end offset of the llama state payload within the file
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+                    std::vector<server_slot_ckpt_info> ckpt_info;
+                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot, ckpt_info);
                     const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
@@ -3351,6 +3368,7 @@ private:
                     res->is_save  = false;
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nread + nread_ckpt + nread_dft;
+                    res->checkpoints = std::move(ckpt_info);
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
