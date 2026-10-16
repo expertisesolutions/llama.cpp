@@ -3173,6 +3173,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
+    file.sync_close();
     return res;
 }
 

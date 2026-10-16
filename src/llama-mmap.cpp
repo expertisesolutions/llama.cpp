@@ -1,3 +1,4 @@
+#include "llama-file-sync.h"
 #include "llama-mmap.h"
 
 #include "llama-impl.h"
@@ -376,7 +377,7 @@ struct llama_file::impl {
     ~impl() {
         if (fd != -1) {
             close(fd);
-        } else if (owns_fp) {
+        } else if (fp && owns_fp) {
             std::fclose(fp);
         }
     }
@@ -401,6 +402,12 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
+
+void llama_file::sync_close() {
+    FILE * fp = pimpl->fp;
+    pimpl->fp = nullptr;
+    llama_file_sync_close(fp);
+}
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }

@@ -1,3 +1,4 @@
+#include "../../src/llama-file-sync.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -2367,12 +2368,14 @@ private:
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }
 
-    static void ckpt_write(std::ofstream & ofs, const void * src, size_t size, size_t & n_written) {
-        ofs.write((const char *) src, size);
+    static void ckpt_write(FILE * ofs, const void * src, size_t size, size_t & n_written) {
+        if (size && std::fwrite(src, 1, size, ofs) != size) {
+            throw std::runtime_error("failed to write context checkpoint appendix");
+        }
         n_written += size;
     }
 
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+    static void ckpt_write_buf(FILE * ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
         const uint64_t n = buf.size();
         ckpt_write(ofs, &n, sizeof(n), n_written);
         if (n > 0) {
@@ -2387,11 +2390,11 @@ private:
         if (slot.prompt.checkpoints.empty()) {
             return 0;
         }
-        std::ofstream ofs(filepath, std::ios::binary | std::ios::app);
-        if (!ofs) {
-            SRV_WRN("failed to append context checkpoints to '%s'\n", filepath.c_str());
-            return 0;
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(filepath.c_str(), "ab"), &std::fclose);
+        if (!file) {
+            throw std::runtime_error("failed to open context checkpoint appendix");
         }
+        FILE * ofs = file.get();
         size_t n_written = 0;
         const uint32_t magic   = SLOT_CKPT_MAGIC;
         const uint32_t version = SLOT_CKPT_VERSION;
@@ -2409,36 +2412,36 @@ private:
             ckpt_write_buf(ofs, cur.data_spec, n_written);
             info.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_written - n_start });
         }
-        ofs.flush();
-        if (!ofs) {
-            SRV_WRN("failed to append context checkpoints to '%s' - the appendix is incomplete\n", filepath.c_str());
-            info.clear();
-            return 0;
-        }
+        llama_file_sync_close(file.release());
         SRV_INF("appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
                 count, (float) n_written / 1024 / 1024, filepath.c_str());
         return n_written;
     }
 
-    // returns the number of bytes consumed, 0 if there is no usable appendix
+    // Returns 0 for legacy files without an appendix; malformed appendices throw.
     size_t load_slot_checkpoints(const std::string & filepath, size_t offset, server_slot & slot,
                                  std::vector<server_slot_ckpt_info> & info) const {
         info.clear();
         std::ifstream ifs(filepath, std::ios::binary);
         if (!ifs || !ifs.seekg(offset)) {
-            return 0;
+            throw std::runtime_error("failed to open context checkpoint appendix");
         }
         size_t n_read = 0;
         uint32_t magic   = 0;
         uint32_t version = 0;
         uint32_t count   = 0;
-        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_CKPT_MAGIC) {
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read)) {
+            if (ifs.eof() && ifs.gcount() == 0) {
+                return 0;
+            }
+            throw std::runtime_error("truncated context checkpoint magic");
+        }
+        if (magic != SLOT_CKPT_MAGIC) {
             return 0;
         }
         if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_CKPT_VERSION ||
             !ckpt_read(ifs, &count,   sizeof(count),   n_read) || count > 1024) {
-            SRV_WRN("invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
-            return 0;
+            throw std::runtime_error("invalid context checkpoint appendix");
         }
         std::list<common_prompt_checkpoint> checkpoints;
         std::vector<server_slot_ckpt_info> infos;
@@ -2452,8 +2455,7 @@ private:
                 !ckpt_read_buf(ifs, cur.data_tgt,  n_read) ||
                 !ckpt_read_buf(ifs, cur.data_dft,  n_read) ||
                 !ckpt_read_buf(ifs, cur.data_spec, n_read)) {
-                SRV_WRN("truncated context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
-                return 0;
+                throw std::runtime_error("truncated context checkpoint appendix");
             }
             infos.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_read - n_start });
             checkpoints.push_back(std::move(cur));
@@ -2677,7 +2679,13 @@ private:
                     }
 
                     std::vector<server_slot_ckpt_info> ckpt_info;
-                    const size_t nwrite_ckpt = save_slot_checkpoints(filepath, *slot, nwrite, ckpt_info);
+                    size_t nwrite_ckpt = 0;
+                    try {
+                        nwrite_ckpt = save_slot_checkpoints(filepath, *slot, nwrite, ckpt_info);
+                    } catch (const std::exception & err) {
+                        send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2715,6 +2723,8 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     size_t nread = 0;
+                    size_t nread_ckpt = 0;
+                    std::vector<server_slot_ckpt_info> ckpt_info;
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
@@ -2740,15 +2750,12 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        nread_ckpt = load_slot_checkpoints(filepath, nread, *slot, ckpt_info);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-
-                    // nread is the end offset of the llama state payload within the file
-                    std::vector<server_slot_ckpt_info> ckpt_info;
-                    const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot, ckpt_info);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
