@@ -37,6 +37,8 @@ def test_slot_save_restore():
     })
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
+    slot_file = os.path.join(server.slot_save_path, "slot1.bin")
+    assert res.body["n_written"] == os.path.getsize(slot_file)
 
     # Since we have cache, this should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -54,6 +56,7 @@ def test_slot_save_restore():
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == 84
+    assert res.body["n_read"] == os.path.getsize(slot_file)
 
     # Since we have cache, slot 0 should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -546,3 +549,87 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+@pytest.fixture
+def swa_server():
+    swa = ServerPreset.tinygemma3()
+    swa.slot_save_path = "./tmp"
+    swa.temperature = 0.0
+    swa.cache_ram = 0
+    # Keep the first prompt checkpoint before the divergence point.
+    swa.n_ubatch = 32
+    return swa
+
+
+def test_slot_restore_preserves_context_checkpoints(swa_server):
+    server = swa_server
+    server.start()
+
+    base = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_full = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_live = res.body["timings"]["prompt_n"]
+    assert n_live < n_full
+
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "ckpt_slot1.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_saved"] > 0
+    ckpt_file = os.path.join(server.slot_save_path, "ckpt_slot1.bin")
+    assert res.body["n_written"] == os.path.getsize(ckpt_file)
+    saved_ckpts = res.body["checkpoints"]
+    assert len(saved_ckpts) >= 1
+    prev_offset = res.body["n_state_bytes"] - 1
+    for c in saved_ckpts:
+        assert c["n_tokens"] > 0
+        assert c["offset"] >= res.body["n_state_bytes"]
+        assert c["offset"] > prev_offset
+        prev_offset = c["offset"]
+    assert saved_ckpts[-1]["offset"] + saved_ckpts[-1]["bytes"] == res.body["n_written"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Unrelated text with no common prefix occupies the slot now.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "ckpt_slot1.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_read"] == os.path.getsize(ckpt_file)
+    assert res.body["checkpoints"] == saved_ckpts
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == n_live

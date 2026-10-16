@@ -1620,12 +1620,25 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
+    json ckpts = json::array();
+    for (const auto & c : checkpoints) {
+        ckpts.push_back({
+            { "n_tokens", c.n_tokens },
+            { "pos_min",  c.pos_min },
+            { "pos_max",  c.pos_max },
+            { "offset",   c.offset },
+            { "bytes",    c.bytes },
+        });
+    }
+
     if (is_save) {
         return json {
-            { "id_slot",   id_slot },
-            { "filename",  filename },
-            { "n_saved",   n_tokens },
-            { "n_written", n_bytes },
+            { "id_slot",       id_slot },
+            { "filename",      filename },
+            { "n_saved",       n_tokens },
+            { "n_written",     n_bytes },
+            { "n_state_bytes", n_state_bytes },
+            { "checkpoints",   ckpts },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1633,10 +1646,11 @@ json server_task_result_slot_save_load::to_json() {
     }
 
     return json {
-        { "id_slot",    id_slot },
-        { "filename",   filename },
-        { "n_restored", n_tokens },
-        { "n_read",     n_bytes },
+        { "id_slot",     id_slot },
+        { "filename",    filename },
+        { "n_restored",  n_tokens },
+        { "n_read",      n_bytes },
+        { "checkpoints", ckpts },
         { "timings", {
             { "restore_ms", t_ms }
         }},

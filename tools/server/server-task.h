@@ -518,12 +518,23 @@ struct server_task_result_slots : server_task_result {
     virtual json to_json() override;
 };
 
+// location of one context checkpoint record inside a slot save file
+struct server_slot_ckpt_info {
+    int64_t  n_tokens;
+    int32_t  pos_min;
+    int32_t  pos_max;
+    uint64_t offset; // absolute file offset of the record start
+    uint64_t bytes;  // record length
+};
+
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
 
     size_t n_tokens;
     size_t n_bytes;
+    size_t n_state_bytes = 0; // save only: size of the llama state payload, i.e. where the checkpoint appendix starts
+    std::vector<server_slot_ckpt_info> checkpoints;
     double t_ms;
 
     virtual json to_json() override;
