@@ -241,4 +241,7 @@ struct server_response_reader {
     batch_response wait_for_all(const std::function<bool()> & should_stop);
 
     void stop();
+
+    // stop waiting for the results, but let the posted tasks run to completion (no cancel task is sent)
+    void detach();
 };
