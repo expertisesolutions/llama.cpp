@@ -166,6 +166,10 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // set when the operation is recorded in server_storage_ops (see server-storage-ops.h)
+        bool        tracked = false;
+        int         tracked_id_slot = -1; // id_slot normalized like get_slot_by_id()
+        std::string operation_id;         // restore / erase identity, empty for save
     };
     slot_action slot_action;
 

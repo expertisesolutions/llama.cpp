@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-storage-ops.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -27,6 +28,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -38,6 +40,81 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static server_storage_op_key storage_op_key(server_task_type type, int id_slot,
+                                            const std::string & filename, const std::string & operation_id) {
+    switch (type) {
+        case SERVER_TASK_TYPE_SLOT_SAVE:    return { id_slot, "save",    filename };
+        case SERVER_TASK_TYPE_SLOT_RESTORE: return { id_slot, "restore", operation_id };
+        case SERVER_TASK_TYPE_SLOT_ERASE:   return { id_slot, "erase",   operation_id };
+        default: GGML_ABORT("not a storage task");
+    }
+}
+
+// publishes the lifecycle of a tracked storage operation from inside its handler
+// any exit without complete() or keep_queued() publishes failed, so a tracked operation never stays outstanding
+struct storage_op_scope {
+    server_storage_ops *   ops = nullptr;
+    server_storage_op_key  key;
+
+    storage_op_scope(server_storage_ops & storage_ops, const server_task & task) {
+        if (!task.slot_action.tracked) {
+            return;
+        }
+        ops = &storage_ops;
+        key = storage_op_key(task.type, task.slot_action.tracked_id_slot, task.slot_action.filename, task.slot_action.operation_id);
+    }
+
+    ~storage_op_scope() {
+        fail("internal_error");
+    }
+
+    void run() {
+        if (ops) {
+            ops->set_running(key);
+        }
+    }
+
+    // the task was deferred, it is handled again later
+    void keep_queued() {
+        ops = nullptr;
+    }
+
+    void fail(const char * error_code) {
+        if (ops) {
+            ops->set_failed(key, error_code);
+            ops = nullptr;
+        }
+    }
+
+    void complete(const json & result) {
+        if (ops) {
+            ops->set_completed(key, safe_json_to_str(result));
+            ops = nullptr;
+        }
+    }
+};
+
+// test-only seams, inert unless LLAMA_SERVER_TEST_STORAGE_HOOKS is set:
+//   <filepath>.hold            - the save / restore handler blocks while this file exists
+//   <filepath>.fail-checkpoint - the save fails after the state write, before the checkpoint appendix
+static bool storage_test_hooks_enabled() {
+    static const bool enabled = !common_get_env("LLAMA_SERVER_TEST_STORAGE_HOOKS").empty();
+    return enabled;
+}
+
+static void storage_test_hold(const std::string & filepath) {
+    if (!storage_test_hooks_enabled()) {
+        return;
+    }
+    while (std::filesystem::exists(filepath + ".hold")) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+static bool storage_test_fail_checkpoint(const std::string & filepath) {
+    return storage_test_hooks_enabled() && std::filesystem::exists(filepath + ".fail-checkpoint");
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -847,6 +924,9 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+
+    // thread-safe, read directly by the HTTP threads
+    server_storage_ops storage_ops;
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -2643,28 +2723,36 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    storage_op_scope op(storage_ops, task);
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        op.fail("invalid_slot");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        op.keep_queued();
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    op.run();
 
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    storage_test_hold(filepath);
+
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
                     } catch (const std::exception & err) {
+                        op.fail("serialize_failed");
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
@@ -2674,6 +2762,7 @@ private:
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
+                        op.fail("state_write_failed");
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -2681,8 +2770,12 @@ private:
                     std::vector<server_slot_ckpt_info> ckpt_info;
                     size_t nwrite_ckpt = 0;
                     try {
+                        if (storage_test_fail_checkpoint(filepath)) {
+                            throw std::runtime_error("injected context checkpoint appendix failure");
+                        }
                         nwrite_ckpt = save_slot_checkpoints(filepath, *slot, nwrite, ckpt_info);
                     } catch (const std::exception & err) {
+                        op.fail("checkpoint_write_failed");
                         send_error(task, std::string("Unable to save slot: ") + err.what(), ERROR_TYPE_SERVER);
                         break;
                     }
@@ -2700,27 +2793,35 @@ private:
                     res->n_state_bytes = nwrite;
                     res->checkpoints   = std::move(ckpt_info);
                     res->t_ms     = t_save_ms;
+                    op.complete(res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    storage_op_scope op(storage_ops, task);
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        op.fail("invalid_slot");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        op.keep_queued();
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    op.run();
 
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    storage_test_hold(filepath);
 
                     size_t nread = 0;
                     size_t nread_ckpt = 0;
@@ -2753,6 +2854,7 @@ private:
                         nread_ckpt = load_slot_checkpoints(filepath, nread, *slot, ckpt_info);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
+                        op.fail("restore_failed");
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -2769,22 +2871,28 @@ private:
                     res->n_bytes  = nread + nread_ckpt;
                     res->checkpoints = std::move(ckpt_info);
                     res->t_ms     = t_restore_ms;
+                    op.complete(res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
+                    storage_op_scope op(storage_ops, task);
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        op.fail("invalid_slot");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        op.keep_queued();
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    op.run();
 
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
@@ -2795,6 +2903,7 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    op.complete(res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -4915,6 +5024,75 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // reads only the storage operation registry: it never waits for the task queue or a running disk operation
+    this->get_storage_operations = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        int id_slot;
+        try {
+            size_t n_parsed = 0;
+            const std::string id_slot_str = req.get_param("slot_id");
+            id_slot = std::stoi(id_slot_str, &n_parsed);
+            if (n_parsed != id_slot_str.size() || id_slot < 0) {
+                throw std::invalid_argument("slot_id");
+            }
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string action = req.get_param("action");
+        server_task_type type;
+        std::string identity_field;
+        if (action == "save") {
+            type = SERVER_TASK_TYPE_SLOT_SAVE;
+            identity_field = "filename";
+        } else if (action == "restore") {
+            type = SERVER_TASK_TYPE_SLOT_RESTORE;
+            identity_field = "operation_id";
+        } else if (action == "erase") {
+            type = SERVER_TASK_TYPE_SLOT_ERASE;
+            identity_field = "operation_id";
+        } else {
+            res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string identity = req.get_param(identity_field);
+        if (identity.empty()) {
+            res->error(format_error_response("Missing " + identity_field, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        id_slot %= params.n_parallel;
+        const auto key = storage_op_key(type, id_slot,
+                                        type == SERVER_TASK_TYPE_SLOT_SAVE ? identity : "",
+                                        type == SERVER_TASK_TYPE_SLOT_SAVE ? "" : identity);
+        const auto record = ctx_server.storage_ops.get(key);
+
+        json out = {
+            {"slot_id", id_slot},
+            {"action",  action},
+        };
+        out[identity_field] = identity;
+        if (!record) {
+            out["status"] = "unknown";
+        } else {
+            out["status"] = server_storage_op_status_str(record->status);
+            if (record->status == SERVER_STORAGE_OP_COMPLETED) {
+                out["result"] = json::parse(record->result_json);
+            } else if (record->status == SERVER_STORAGE_OP_FAILED) {
+                out["error"] = record->error_code;
+            }
+        }
+        res->ok(out);
+        return res;
+    };
+
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
@@ -5401,30 +5579,44 @@ void server_routes::init_routes() {
     };
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
-    auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
-    if (!fs_validate_filename(filename)) {
-        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
-        return res;
-    }
-    std::string filepath = params.slot_save_path + filename;
+static json storage_op_error(int code, const std::string & type, const std::string & message) {
+    return json {
+        {"code",    code},
+        {"message", message},
+        {"type",    type},
+    };
+}
 
-    auto & rd = res->rd;
-    {
-        server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
-        task.id = rd.get_new_id();
-        task.slot_action.id_slot  = id_slot;
-        task.slot_action.filename = filename;
-        task.slot_action.filepath = filepath;
-        rd.post_task(std::move(task));
+// operation_id is optional, a missing one returns "" (legacy client); a present one must be a non-empty bounded string
+static std::string storage_op_parse_operation_id(const json & request_data) {
+    if (!request_data.is_object() || !request_data.contains("operation_id") || request_data.at("operation_id").is_null()) {
+        return "";
     }
+    const json & value = request_data.at("operation_id");
+    if (!value.is_string()) {
+        throw std::invalid_argument("operation_id must be a string");
+    }
+    std::string operation_id = value.get<std::string>();
+    if (operation_id.empty() || operation_id.size() > 255) {
+        throw std::invalid_argument("operation_id must be 1 to 255 bytes");
+    }
+    return operation_id;
+}
+
+// posts a storage task and waits for its result; a tracked task is never cancelled when the client goes away
+static std::unique_ptr<server_res_generator> storage_op_run(std::unique_ptr<server_res_generator> res, server_task && task, const server_http_req & req) {
+    const bool tracked = task.slot_action.tracked;
+    auto & rd = res->rd;
+    task.id = rd.get_new_id();
+    rd.post_task(std::move(task));
 
     auto result = rd.next(req.should_stop);
     if (!result) {
         // connection was closed
         GGML_ASSERT(req.should_stop());
+        if (tracked) {
+            rd.detach();
+        }
         return res;
     }
 
@@ -5435,6 +5627,54 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
 
     res->ok(result->to_json());
     return res;
+}
+
+// records the operation as queued before the task is posted; on refusal fills res and returns false
+static bool storage_op_admit(server_storage_ops & ops, server_task & task, int n_slots, server_res_generator & res) {
+    if (task.slot_action.id_slot < 0 || n_slots <= 0) {
+        res.error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+        return false;
+    }
+    task.slot_action.tracked         = true;
+    task.slot_action.tracked_id_slot = task.slot_action.id_slot % n_slots;
+    const server_storage_op_key key = storage_op_key(task.type, task.slot_action.tracked_id_slot,
+                                                     task.slot_action.filename, task.slot_action.operation_id);
+    server_storage_op_status active = SERVER_STORAGE_OP_QUEUED;
+    switch (ops.admit(key, &active)) {
+        case SERVER_STORAGE_OP_ADMIT_OK:
+            return true;
+        case SERVER_STORAGE_OP_ADMIT_CONFLICT:
+            {
+                json err = storage_op_error(409, "conflict_error", "A storage operation with the same identity is already " + std::string(server_storage_op_status_str(active)));
+                err["operation_status"] = server_storage_op_status_str(active);
+                res.error(err);
+            } return false;
+        case SERVER_STORAGE_OP_ADMIT_LIMIT:
+            res.error(storage_op_error(429, "rate_limit_error", "Too many outstanding storage operations on this slot"));
+            return false;
+    }
+    return false;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json request_data = json::parse(req.body);
+    std::string filename = request_data.at("filename");
+    if (!fs_validate_filename(filename)) {
+        res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filepath = params.slot_save_path + filename;
+
+    server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
+    task.slot_action.id_slot  = id_slot;
+    task.slot_action.filename = filename;
+    task.slot_action.filepath = filepath;
+    // every save is tracked, its identity is the filename
+    if (!storage_op_admit(ctx_server.storage_ops, task, params.n_parallel, *res)) {
+        return res;
+    }
+    return storage_op_run(std::move(res), std::move(task), req);
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const server_http_req & req, int id_slot) {
@@ -5446,59 +5686,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+    std::string operation_id = storage_op_parse_operation_id(request_data);
 
-    auto & rd = res->rd;
-    {
-        server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
-        task.id = rd.get_new_id();
-        task.slot_action.id_slot  = id_slot;
-        task.slot_action.filename = filename;
-        task.slot_action.filepath = filepath;
-        rd.post_task(std::move(task));
-    }
-
-    auto result = rd.next(req.should_stop);
-    if (!result) {
-        // connection was closed
-        GGML_ASSERT(req.should_stop());
+    server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
+    task.slot_action.id_slot      = id_slot;
+    task.slot_action.filename     = filename;
+    task.slot_action.filepath     = filepath;
+    task.slot_action.operation_id = operation_id;
+    // without operation_id the restore is a legacy, untracked one
+    if (!operation_id.empty() && !storage_op_admit(ctx_server.storage_ops, task, params.n_parallel, *res)) {
         return res;
     }
-
-    if (result->is_error()) {
-        res->error(result->to_json());
-        return res;
-    }
-
-    GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
-    res->ok(result->to_json());
-    return res;
+    return storage_op_run(std::move(res), std::move(task), req);
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const server_http_req & req, int id_slot) {
     auto res = create_response();
-    auto & rd = res->rd;
-    {
-        server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
-        task.id = rd.get_new_id();
-        task.slot_action.id_slot = id_slot;
-        rd.post_task(std::move(task));
+    // legacy clients send no body, or a body that is ignored
+    std::string operation_id;
+    if (!req.body.empty()) {
+        operation_id = storage_op_parse_operation_id(json::parse_no_throw(req.body));
     }
 
-    auto result = rd.next(req.should_stop);
-    if (!result) {
-        // connection was closed
-        GGML_ASSERT(req.should_stop());
+    server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
+    task.slot_action.id_slot      = id_slot;
+    task.slot_action.operation_id = operation_id;
+    if (!operation_id.empty() && !storage_op_admit(ctx_server.storage_ops, task, params.n_parallel, *res)) {
         return res;
     }
-
-    if (result->is_error()) {
-        res->error(result->to_json());
-        return res;
-    }
-
-    GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
-    res->ok(result->to_json());
-    return res;
+    return storage_op_run(std::move(res), std::move(task), req);
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {

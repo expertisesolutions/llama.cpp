@@ -619,3 +619,10 @@ void server_response_reader::stop() {
         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
     }
 }
+
+void server_response_reader::detach() {
+    for (const auto & id_task : id_tasks) {
+        queue_results.remove_waiting_task_id(id_task);
+    }
+    cancelled = true;
+}
