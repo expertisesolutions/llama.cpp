@@ -1,5 +1,7 @@
 # Instructions for llama.cpp
 
+> **Expertise fork:** this repository is our fork. The official branch is `expertise-main` (the role `master` has upstream). Every change we run must be merged into it. Read [FORK.md](FORK.md) before you branch, merge, or build a server.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
