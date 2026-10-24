@@ -1,0 +1,20 @@
+ARG SOURCE_COMMIT
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
+
+WORKDIR /build
+
+# Copy source tree
+COPY src.tar .
+RUN tar x
+
+# Build
+RUN apt-get update && apt-get install -y cmake git
+RUN mkdir build && cd build && \
+    cmake .. \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES=60 \
+      -DGGML_RPC=ON && \
+    cmake --build . --config Release -j$(nproc)
+
+LABEL local.source-commit=${SOURCE_COMMIT}
+LABEL local.source-branch=storage-operations
