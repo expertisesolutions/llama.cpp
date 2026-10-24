@@ -211,7 +211,7 @@ mul_mat_vec_q4_1_a16(
         const void * __restrict__ vx, const half2 * __restrict__ aq, const half2 * __restrict__ ads,
         float * __restrict__ dst, const int nblocks, const int stride_row_x,
         const int stride_col_aq, const int stride_col_ads, const int stride_col_dst) {
-#if defined(FP16_AVAILABLE)
+#if defined(FP16_AVAILABLE) && !defined(GGML_USE_HIP) // lop3 PTX below is NVIDIA-only
     const int row0     = blockIdx.x*A16_ROWS;
     const int tid      = threadIdx.x + threadIdx.y*WARP_SIZE;
     const int nthreads = WARP_SIZE*nwarps;
