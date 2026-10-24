@@ -4254,7 +4254,8 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
-        return std::min(res, llama_model_n_ctx_train(model_tgt));
+        // ctxcap bypass: intencionalmente NAO cappa em n_ctx_train, pra permitir -c > n_ctx_train via YaRN (ex: 1M). Sem YaRN a qualidade degrada; warning em ~1232.
+        return res;
     }
 
     server_response_reader get_response_reader() {
