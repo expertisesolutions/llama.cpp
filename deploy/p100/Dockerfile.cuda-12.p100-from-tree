@@ -1,20 +1,70 @@
+FROM docker.io/nvidia/cuda:12.2.2-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/llama.cpp
+# Source tree from git archive: extract src.tar at repo root
+# ARG SOURCE_COMMIT is passed at build time to identify the source
 ARG SOURCE_COMMIT
-FROM nvidia/cuda:12.2.2-devel-ubuntu22.04
+COPY src.tar /tmp/src.tar
+RUN tar -x -f /tmp/src.tar -C /opt/llama.cpp && rm /tmp/src.tar
 
-WORKDIR /build
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
 
-# Copy source tree
-COPY src.tar .
-RUN tar x
+RUN cmake -S . -B build \
+    -DGGML_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=60 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_RPC=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_AVX=ON \
+    -DGGML_AVX2=ON \
+    -DGGML_FMA=ON \
+    -DGGML_F16C=ON \
+    -DGGML_AVX512=OFF \
+    && cmake --build build --config Release -j$(nproc) \
+    && cmake --install build --config Release
 
-# Build
-RUN apt-get update && apt-get install -y cmake git
-RUN mkdir build && cd build && \
-    cmake .. \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CUDA_ARCHITECTURES=60 \
-      -DGGML_RPC=ON && \
-    cmake --build . --config Release -j$(nproc)
+RUN mkdir -p /usr/local/lib/stubs \
+    && find /opt/llama.cpp/build -type f -name 'lib*.so*' -exec cp {} /usr/local/lib/ \; \
+    && cp /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/lib/stubs/libcuda.so.1 \
+    && ldconfig
 
-LABEL local.source-commit=${SOURCE_COMMIT}
-LABEL local.source-branch=storage-operations
+FROM docker.io/nvidia/cuda:12.2.2-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG SOURCE_COMMIT
+LABEL com.github.containers.toolbox="true" \
+      usage="This image is meant to be used with the toolbox command" \
+      summary="Nvidia P100 llama.cpp qwen4exp MTP + P100 patches + slot checkpoints PR26004" \
+      local.source-commit=${SOURCE_COMMIT} \
+      local.source-branch=storage-operations
+
+RUN apt-get update && apt-get install -y \
+    sudo \
+    libcap2-bin \
+    libnss-myhostname \
+    curl \
+    libgomp1 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/machine-id && touch /etc/machine-id \
+    && userdel -r ubuntu || true \
+    && sed -i 's/^hosts:.*/& myhostname/' /etc/nsswitch.conf
+
+COPY --from=builder /usr/local/ /usr/local/
+
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf \
+    && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+    && ldconfig
+
+CMD ["/bin/bash"]
