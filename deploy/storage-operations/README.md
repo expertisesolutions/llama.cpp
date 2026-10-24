@@ -5,8 +5,8 @@ Build contexts for the P100 and 3090 llama-server images that add `GET /storage-
 The patches (01-23, 90-95, 91-92) are now carried in the shared tree as commits, not as loose patch files.
 The tree is the single source of truth for the build.
 
-- `p100/` and `3090/` contain the from-tree recipes that build from the current tree state.
-- `failclosed-b39983005-input-sha256.txt` and `input-sha256.txt` are history of old builds.
+- `deploy/p100/` and `deploy/3090/` contain the from-tree recipes that build from the current tree state.
+- `deploy/storage-operations/failclosed-b39983005-input-sha256.txt` and `deploy/storage-operations/input-sha256.txt` are history of old builds.
 - CUDA architectures: 60 (P100), 86 (3090).
 
 Build (from a new build directory):
