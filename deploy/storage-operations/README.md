@@ -13,7 +13,11 @@ Build contexts for the P100 and 3090 llama-server images that add `GET /storage-
   `patches/p100/*.patch` in glob order with `patch -p1 -F 0`, so patch 95 is applied after
   94 without a recipe change. CUDA architectures: 60 (P100), 86 (3090).
 
-Build (from a new build directory, never over `failclosed-b39983005`):
+- `deploy/p100/` and `deploy/3090/` contain the from-tree recipes that build from the current tree state.
+- `deploy/storage-operations/failclosed-b39983005-input-sha256.txt` and `deploy/storage-operations/input-sha256.txt` are history of old builds.
+- CUDA architectures: 60 (P100), 86 (3090).
+
+Build (from a new build directory):
 
     timeout --signal=TERM --kill-after=120s 6h podman build --layers \
       --label local.storage.source-commit=<full-new-sha> \
