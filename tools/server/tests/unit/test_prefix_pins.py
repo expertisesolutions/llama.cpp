@@ -353,3 +353,24 @@ def test_pin_bound_to_lora_config():
     # a request without pin is not affected
     assert complete(T + U).status_code == 200
 
+
+def test_pins_count_in_context_of_every_completion():
+    server.start()
+    T = tokenize(PIN_TEXT)
+    filler = (T * 20)[:100]
+    for _ in range(4):
+        assert create_pin(filler).status_code == 201
+    assert server.make_request("GET", "/props").body["prefix_pins"]["used_tokens"] == 400
+    # 512 cells - 400 held by pins: a 150 token prompt fits in the slot context alone but not in the pool
+    long_prompt = (T * 20)[:150]
+    res = complete(long_prompt, n_predict=4)
+    assert res.status_code == 400
+    assert error_type(res) == "exceed_context_size_error"
+    pid = list(list_pins())[0]
+    res = complete(filler + long_prompt, prefix_id=pid, n_predict=4)
+    assert res.status_code == 400
+    assert error_type(res) == "prefix_context_exceeded"
+    # a prompt that fits still works, with and without pin
+    assert complete(long_prompt[:40], n_predict=4).status_code == 200
+    res = complete(filler + long_prompt[:40], prefix_id=pid, n_predict=4)
+    assert res.status_code == 200
