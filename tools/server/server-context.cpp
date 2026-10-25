@@ -1870,6 +1870,21 @@ private:
         return res;
     }
 
+    // context left for the request of a slot. pins hold cells of the same pool as the slots (kv_unified:
+    // n_ctx_slot() is the whole n_ctx, or less with --kv-unified-per-slot), so every request must fit in
+    // n_ctx_slot() minus the tokens held by all pins; the chain of the pin used by the slot is shared with
+    // the slot and is not counted twice
+    int32_t n_ctx_avail(const server_slot & slot, const std::string & prefix_id) const {
+        if (!prefix_pins) {
+            return slot.n_ctx;
+        }
+        size_t n_pins = prefix_pins->n_used_tokens();
+        if (!prefix_id.empty()) {
+            n_pins -= prefix_pins->get(prefix_id)->n_tokens();
+        }
+        return slot.n_ctx - (int32_t) n_pins;
+    }
+
     void update_prefix_pin_counters() {
         prefix_pins_used        = (int32_t) prefix_pins->n_used();
         prefix_pins_used_tokens = (int32_t) prefix_pins->n_used_tokens();
@@ -1974,11 +1989,11 @@ private:
             return fail("the adapter config of the request differs from the one used to create the prefix pin",
                         ERROR_TYPE_PREFIX_LORA_MISMATCH);
         }
-        // the cells of the pin chain are shared with the slot, the other pins hold their own cells
-        const size_t n_other = prefix_pins->n_used_tokens() - pin->n_tokens();
-        if (task.tokens.size() + n_other > (size_t) slot.n_ctx) {
+        // same rule as the prompt check in update_slots(), with the pin-specific error type
+        if ((int32_t) task.tokens.size() >= n_ctx_avail(slot, task.prefix_id)) {
             return fail(string_format("prompt (%zu tokens) + other prefix pins (%zu tokens) exceed the context (%d tokens)",
-                        task.tokens.size(), n_other, slot.n_ctx), ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
+                        task.tokens.size(), prefix_pins->n_used_tokens() - pin->n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
         }
 
         prefix_pins->acquire(task.prefix_id);
@@ -2177,7 +2192,7 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= n_ctx_avail(slot, slot.prefix_id)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -3737,22 +3752,22 @@ private:
                                 return;
                             }
 
-                            if (slot.task->n_tokens() > slot.n_ctx) {
+                            if (slot.task->n_tokens() > n_ctx_avail(slot, slot.prefix_id)) {
                                 send_error(
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
+                                        slot.task->n_tokens(), n_ctx_avail(slot, slot.prefix_id)),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (slot.task->n_tokens() >= n_ctx_avail(slot, slot.prefix_id)) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         slot.task->n_tokens(), n_ctx_avail(slot, slot.prefix_id)),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;

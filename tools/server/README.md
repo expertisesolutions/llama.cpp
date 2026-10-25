@@ -1375,7 +1375,7 @@ When `--api-key` is set, the `/prefixes` routes need the same key as the other r
 
 ### Memory cost
 
-Extra sequences cost a fixed amount of memory at startup. On the Qwen hybrid model measured on a P100, each extra sequence costs about 150 MiB, almost all in the recurrent state. A pin does not allocate a context-sized KV cache. It uses only the KV cells of its own tokens inside the unified pool. Requests share that pool, so the tokens held by pins reduce the room for prompts.
+Extra sequences cost a fixed amount of memory at startup. On the Qwen hybrid model measured on a P100, each extra sequence costs about 150 MiB, almost all in the recurrent state. A pin does not allocate a context-sized KV cache. It uses only the KV cells of its own tokens inside the unified pool. Requests share that pool, so the tokens held by pins reduce the room for prompts. Every request, with or without `prefix_id`, must fit in the slot context minus the tokens held by the pins (the chain of the pin used by the request is not counted twice). A request without `prefix_id` that does not fit gets the usual `exceed_context_size_error`, and generation stops at that limit.
 
 ### What pins do not do
 
