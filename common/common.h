@@ -642,6 +642,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t prefix_pins           = 0;     // max number of prefix pins (reserved sequences), 0 = disabled
+    int32_t prefix_pin_max_tokens = 8192;  // max total tokens retained by all prefix pins
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     // llama-connect params
