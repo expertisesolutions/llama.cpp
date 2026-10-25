@@ -1246,6 +1246,16 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
+        // aLoRA keeps only the tokens before its invocation cached, which would cut into a pin (only known after load)
+        if (params_base.prefix_pins > 0) {
+            for (const auto & la : params_base.lora_adapters) {
+                if (llama_adapter_get_alora_n_invocation_tokens(la.ptr) > 0) {
+                    SRV_ERR("%s\n", "prefix-pins is incompatible with aLoRA adapters");
+                    return false;
+                }
+            }
+        }
+
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
@@ -1851,6 +1861,15 @@ private:
     // prefix pins (main loop only)
     //
 
+    // the KV/recurrent state of a pin depends on the adapters applied at prefill; index = adapter id
+    static std::vector<float> prefix_pin_lora_scales(const std::vector<common_adapter_lora_info> & loras) {
+        std::vector<float> res;
+        for (const auto & la : loras) {
+            res.push_back(la.scale);
+        }
+        return res;
+    }
+
     void update_prefix_pin_counters() {
         prefix_pins_used        = (int32_t) prefix_pins->n_used();
         prefix_pins_used_tokens = (int32_t) prefix_pins->n_used_tokens();
@@ -1949,6 +1968,11 @@ private:
             if (task.tokens[i] != pin->tokens[i]) {
                 return fail(string_format("prompt differs from the prefix pin at token %zu", i), ERROR_TYPE_PREFIX_MISMATCH);
             }
+        }
+        // slot.lora is the effective adapter config of this request (per-request or global default)
+        if (prefix_pin_lora_scales(slot.lora) != pin->lora_scales) {
+            return fail("the adapter config of the request differs from the one used to create the prefix pin",
+                        ERROR_TYPE_PREFIX_LORA_MISMATCH);
         }
         // the cells of the pin chain are shared with the slot, the other pins hold their own cells
         const size_t n_other = prefix_pins->n_used_tokens() - pin->n_tokens();
@@ -3157,7 +3181,15 @@ private:
                         send_error(task, "tokens contain invalid token ids", ERROR_TYPE_PREFIX_INVALID_TOKENS);
                         break;
                     }
-                    const auto created = prefix_pins->create(act.parent, act.tokens);
+                    // a pin and its chain must be prefilled with the same adapter config
+                    const auto lora_scales = prefix_pin_lora_scales(params_base.lora_adapters);
+                    const server_prefix_pin * parent = prefix_pins->get(act.parent);
+                    if (parent && parent->lora_scales != lora_scales) {
+                        send_error(task, "the adapter config differs from the one used to create the parent prefix pin",
+                                   ERROR_TYPE_PREFIX_LORA_MISMATCH);
+                        break;
+                    }
+                    const auto created = prefix_pins->create(act.parent, act.tokens, lora_scales);
                     if (created.error != SERVER_PREFIX_PIN_OK) {
                         send_prefix_pin_error(task, created.error);
                         break;

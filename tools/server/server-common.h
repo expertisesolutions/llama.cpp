@@ -65,6 +65,7 @@ enum error_type {
     // prefix pins, custom errors (see format_error_response for type strings and statuses)
     ERROR_TYPE_PREFIX_INVALID_TOKENS,
     ERROR_TYPE_PREFIX_MISMATCH,
+    ERROR_TYPE_PREFIX_LORA_MISMATCH,
     ERROR_TYPE_PREFIX_REQUIRES_SLOT,
     ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT,
     ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT,

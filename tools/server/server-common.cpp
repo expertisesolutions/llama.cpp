@@ -54,6 +54,7 @@ json format_error_response(const std::string & message, const enum error_type ty
             break;
         case ERROR_TYPE_PREFIX_INVALID_TOKENS:        type_str = "invalid_tokens";               code = 400; break;
         case ERROR_TYPE_PREFIX_MISMATCH:              type_str = "prefix_mismatch";              code = 400; break;
+        case ERROR_TYPE_PREFIX_LORA_MISMATCH:         type_str = "prefix_lora_mismatch";         code = 400; break;
         case ERROR_TYPE_PREFIX_REQUIRES_SLOT:         type_str = "prefix_requires_slot";         code = 400; break;
         case ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT: type_str = "prefix_requires_cache_prompt"; code = 400; break;
         case ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT:      type_str = "prefix_prompt_too_short";      code = 400; break;

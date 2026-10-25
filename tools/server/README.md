@@ -1268,6 +1268,7 @@ Each pin uses a reserved internal sequence. It is never a slot. With `--prefix-p
 | speculative decoding or a draft model is on | `prefix-pins is incompatible with speculative decoding` |
 | `--context-shift` is on | `prefix-pins is incompatible with --context-shift` |
 | `--sleep-idle-seconds` above 0 | `prefix-pins is incompatible with --sleep-idle-seconds` |
+| an aLoRA adapter is loaded | `prefix-pins is incompatible with aLoRA adapters` |
 
 `--spec-type none` is accepted.
 
@@ -1332,6 +1333,7 @@ Add `"prefix_id"` to a `/completion` request. These rules apply:
 - `cache_prompt` must be true.
 - The prompt must be strictly longer than the pin.
 - The first `n_tokens` tokens of the prompt must be exactly the tokens of the pin.
+- The LoRA adapter scales of the request must be the scales that were active when the pin was created.
 
 The server clears the sequence of the slot, shares the state of the pin with the slot, and processes only the tokens after the pin. `timings.cache_n` is then at least `n_tokens` of the pin. The server never ignores a bad `prefix_id`. It answers with an error.
 
@@ -1344,6 +1346,7 @@ The error body has the usual shape: `{"error": {"code": ..., "message": ..., "ty
 | Status | `error.type` | Cause |
 | ------ | ------------ | ----- |
 | 400 | `prefix_mismatch` | the first tokens of the prompt differ from the pin |
+| 400 | `prefix_lora_mismatch` | the LoRA adapter scales of the request (per-request `lora`, or the current `/lora-adapters` default) differ from the scales used to create the pin; for `POST /prefixes`, the current default differs from the parent |
 | 400 | `prefix_requires_slot` | `prefix_id` without `id_slot` |
 | 400 | `prefix_requires_cache_prompt` | `prefix_id` with `cache_prompt` false |
 | 400 | `prefix_prompt_too_short` | the prompt has no token after the pin |
