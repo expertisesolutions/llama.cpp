@@ -8,6 +8,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-storage-ops.h"
+#include "server-prefix-pins.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -995,6 +996,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // prefix pins: reserved seq ids [n_parallel, n_parallel + prefix_pins), only set when --prefix-pins > 0
+    std::unique_ptr<server_prefix_pins> prefix_pins;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1082,6 +1086,33 @@ private:
         return true;
     }
 
+    // prefix pins live in reserved sequences of the shared KV pool; refuse every option that could touch or drop them
+    static bool validate_prefix_pins(const common_params & params) {
+        if (params.prefix_pins <= 0) {
+            return true;
+        }
+        const char * err = nullptr;
+        if (!params.kv_unified) {
+            err = "prefix-pins requires --kv-unified";
+        } else if (params.cache_ram_mib != 0) {
+            err = "prefix-pins requires --cache-ram 0";
+        } else if (params.speculative.has_dft() ||
+                   // any type but none: "--spec-type none" appends to the default and yields {none, none}
+                   std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+                               [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+            err = "prefix-pins is incompatible with speculative decoding";
+        } else if (params.ctx_shift) {
+            err = "prefix-pins is incompatible with --context-shift";
+        } else if (params.sleep_idle_seconds > 0) {
+            err = "prefix-pins is incompatible with --sleep-idle-seconds";
+        }
+        if (err != nullptr) {
+            SRV_ERR("%s\n", err);
+            return false;
+        }
+        return true;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1095,6 +1126,10 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        if (params_base.prefix_pins > 0) {
+            // the output buffer is reserved for n_seq_max = n_parallel + prefix_pins sequences
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_parallel + params_base.prefix_pins);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1102,6 +1137,10 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        if (!validate_prefix_pins(params_base)) {
+            return false;
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1512,6 +1551,14 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+
+        if (params_base.prefix_pins > 0) {
+            prefix_pins = std::make_unique<server_prefix_pins>(
+                    params_base.n_parallel, params_base.prefix_pins, (size_t) params_base.prefix_pin_max_tokens);
+            SRV_INF("prefix pins enabled, max = %d, max tokens = %d, reserved seq ids [%d, %d)\n",
+                    params_base.prefix_pins, params_base.prefix_pin_max_tokens,
+                    params_base.n_parallel, params_base.n_parallel + params_base.prefix_pins);
         }
 
         {
@@ -3449,9 +3496,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // with prefix pins, the shift would also move the KV cells that the slot shares with a pin
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    prefix_pins == nullptr;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
