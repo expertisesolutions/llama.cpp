@@ -1242,6 +1242,146 @@ To know the `id` of the adapter, use GET `/lora-adapters`
 ]
 ```
 
+## Prefix pins
+
+A prefix pin keeps the processed state of a fixed token prefix in memory. A client creates the pin once. Later requests start from the pin and process only the tokens after it. This saves the prompt processing time of the shared prefix.
+
+The feature is off by default. With `--prefix-pins 0` the server behaves as before.
+
+### Flags
+
+| Argument | Explanation |
+| -------- | ----------- |
+| `--prefix-pins N` | maximum number of pins (default: 0, 0 = off, maximum 16)<br/>(env: LLAMA_ARG_PREFIX_PINS) |
+| `--prefix-pin-max-tokens N` | maximum total tokens held by all pins (default: 8192)<br/>(env: LLAMA_ARG_PREFIX_PIN_MAX_TOKENS) |
+
+A pin that has a parent counts only its own tokens (the tokens after the parent) in this total.
+
+### Startup requirements
+
+Each pin uses a reserved internal sequence. It is never a slot. With `--prefix-pins` above 0, the server refuses to start and exits with a non-zero code in these cases:
+
+| Condition | Message |
+| --------- | ------- |
+| no `--kv-unified` | `prefix-pins requires --kv-unified` |
+| `--cache-ram` is not 0 | `prefix-pins requires --cache-ram 0` |
+| speculative decoding or a draft model is on | `prefix-pins is incompatible with speculative decoding` |
+| `--context-shift` is on | `prefix-pins is incompatible with --context-shift` |
+| `--sleep-idle-seconds` above 0 | `prefix-pins is incompatible with --sleep-idle-seconds` |
+
+`--spec-type none` is accepted.
+
+### Create a pin: `POST /prefixes`
+
+Request body:
+
+```json
+{"tokens": [1, 2, 3]}
+```
+
+To make a child pin, add the id of the parent. The `tokens` are then the tokens after the parent:
+
+```json
+{"parent": "p_0123456789abcdef", "tokens": [4, 5]}
+```
+
+The server processes the tokens in a reserved sequence. It does not sample or generate a token. A child starts as a copy of its parent and processes only its own tokens.
+
+Response `201`:
+
+```json
+{"prefix_id": "p_0123456789abcdef", "n_tokens": 3, "parent": null, "kv_cells": 3}
+```
+
+- `n_tokens` is the length of the whole chain, parent tokens included.
+- `kv_cells` is the number of cells that the pin holds itself. For a child it is the number of its own tokens.
+
+### List pins: `GET /prefixes`
+
+Response `200`: an array with one object per pin.
+
+```json
+[
+  {
+    "prefix_id": "p_0123456789abcdef",
+    "n_tokens": 3,
+    "parent": null,
+    "children": [],
+    "in_use": false,
+    "kv_cells": 3,
+    "tokens_sha256": "..."
+  }
+]
+```
+
+`in_use` is true while a running request uses the pin. `tokens_sha256` is the SHA-256 of the token ids over the full chain, parent tokens included. Each id is written as 4 bytes, int32, little-endian, and the bytes are joined in order. The hash is lowercase hex.
+
+### Delete a pin: `DELETE /prefixes/{id}`
+
+| Status | Meaning |
+| ------ | ------- |
+| 204 | the pin is deleted (empty body) |
+| 404 | `prefix_not_found` |
+| 409 | `prefix_has_children` or `prefix_in_use` |
+
+### Use a pin: `prefix_id` in `POST /completion`
+
+Add `"prefix_id"` to a `/completion` request. These rules apply:
+
+- The request must set `id_slot` (0 or higher).
+- `cache_prompt` must be true.
+- The prompt must be strictly longer than the pin.
+- The first `n_tokens` tokens of the prompt must be exactly the tokens of the pin.
+
+The server clears the sequence of the slot, shares the state of the pin with the slot, and processes only the tokens after the pin. `timings.cache_n` is then at least `n_tokens` of the pin. The server never ignores a bad `prefix_id`. It answers with an error.
+
+`prefix_id` is read only on `/completion`. A child task created by `n_cmpl` does not carry it.
+
+### Errors
+
+The error body has the usual shape: `{"error": {"code": ..., "message": ..., "type": ...}}`.
+
+| Status | `error.type` | Cause |
+| ------ | ------------ | ----- |
+| 400 | `prefix_mismatch` | the first tokens of the prompt differ from the pin |
+| 400 | `prefix_requires_slot` | `prefix_id` without `id_slot` |
+| 400 | `prefix_requires_cache_prompt` | `prefix_id` with `cache_prompt` false |
+| 400 | `prefix_prompt_too_short` | the prompt has no token after the pin |
+| 400 | `prefix_context_exceeded` | the prompt plus the tokens of the other pins is longer than the context |
+| 400 | `invalid_tokens` | `tokens` is empty, is not an array of token ids, or has ids outside the vocabulary |
+| 404 | `prefix_not_found` | unknown `prefix_id` or unknown `parent` |
+| 409 | `prefix_has_children` | delete of a pin that has children |
+| 409 | `prefix_in_use` | delete of a pin that a running request uses |
+| 500 | `prefix_prefill_failed` | the server could not process the tokens; the pin is not kept |
+| 503 | `prefix_pins_disabled` | the server runs with `--prefix-pins 0` |
+| 507 | `prefix_capacity` | no free pin sequence, or the total would pass `--prefix-pin-max-tokens` |
+
+`prefix_context_exceeded` also answers a `POST /prefixes` when the tokens held by the pins would fill the context of a slot.
+
+When `--api-key` is set, the `/prefixes` routes need the same key as the other routes.
+
+### `GET /props`
+
+`/props` has a `prefix_pins` block:
+
+```json
+{"prefix_pins": {"enabled": true, "max": 8, "used": 2, "max_tokens": 8192, "used_tokens": 3500}}
+```
+
+`used_tokens` is the sum of the own tokens of all pins. A client can subtract it from the context size to know how much room is left for prompts.
+
+### Memory cost
+
+Extra sequences cost a fixed amount of memory at startup. On the Qwen hybrid model measured on a P100, each extra sequence costs about 150 MiB, almost all in the recurrent state. A pin does not allocate a context-sized KV cache. It uses only the KV cells of its own tokens inside the unified pool. Requests share that pool, so the tokens held by pins reduce the room for prompts.
+
+### What pins do not do
+
+- The server does not choose a prefix. The client sends `prefix_id` in each request.
+- The server never evicts a pin. It answers `prefix_capacity` instead. The client must delete a pin to make room.
+- Pins are lost when the server restarts. The client must create them again.
+- A pin never changes after creation. To change a prefix, create a new pin.
+- Slot actions (`erase`, `save`, `restore`), cancel of a request, and idle slot cleanup do not touch pins.
+
 ## OpenAI-compatible API Endpoints
 
 ### GET `/v1/models`: OpenAI-compatible Model Info API
