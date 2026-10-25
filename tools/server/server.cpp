@@ -286,6 +286,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     ctx_http.get ("/storage-operations",       ex_wrapper(routes.get_storage_operations));
+    // prefix pins (503 prefix_pins_disabled unless --prefix-pins)
+    ctx_http.get ("/prefixes",                 ex_wrapper(routes.get_prefixes));
+    ctx_http.post("/prefixes",                 ex_wrapper(routes.post_prefixes));
+    ctx_http.del ("/prefixes/:id",             ex_wrapper(routes.delete_prefix));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

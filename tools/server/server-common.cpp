@@ -52,6 +52,18 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_PREFIX_INVALID_TOKENS:        type_str = "invalid_tokens";               code = 400; break;
+        case ERROR_TYPE_PREFIX_MISMATCH:              type_str = "prefix_mismatch";              code = 400; break;
+        case ERROR_TYPE_PREFIX_REQUIRES_SLOT:         type_str = "prefix_requires_slot";         code = 400; break;
+        case ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT: type_str = "prefix_requires_cache_prompt"; code = 400; break;
+        case ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT:      type_str = "prefix_prompt_too_short";      code = 400; break;
+        case ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED:      type_str = "prefix_context_exceeded";      code = 400; break;
+        case ERROR_TYPE_PREFIX_NOT_FOUND:             type_str = "prefix_not_found";             code = 404; break;
+        case ERROR_TYPE_PREFIX_HAS_CHILDREN:          type_str = "prefix_has_children";          code = 409; break;
+        case ERROR_TYPE_PREFIX_IN_USE:                type_str = "prefix_in_use";                code = 409; break;
+        case ERROR_TYPE_PREFIX_PREFILL_FAILED:        type_str = "prefix_prefill_failed";        code = 500; break;
+        case ERROR_TYPE_PREFIX_PINS_DISABLED:         type_str = "prefix_pins_disabled";         code = 503; break;
+        case ERROR_TYPE_PREFIX_CAPACITY:              type_str = "prefix_capacity";              code = 507; break;
     }
     return json {
         {"code", code},

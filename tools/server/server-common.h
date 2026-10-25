@@ -62,6 +62,19 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    // prefix pins, custom errors (see format_error_response for type strings and statuses)
+    ERROR_TYPE_PREFIX_INVALID_TOKENS,
+    ERROR_TYPE_PREFIX_MISMATCH,
+    ERROR_TYPE_PREFIX_REQUIRES_SLOT,
+    ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT,
+    ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT,
+    ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED,
+    ERROR_TYPE_PREFIX_NOT_FOUND,
+    ERROR_TYPE_PREFIX_HAS_CHILDREN,
+    ERROR_TYPE_PREFIX_IN_USE,
+    ERROR_TYPE_PREFIX_PREFILL_FAILED,
+    ERROR_TYPE_PREFIX_PINS_DISABLED,
+    ERROR_TYPE_PREFIX_CAPACITY,
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

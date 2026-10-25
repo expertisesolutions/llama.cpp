@@ -19,8 +19,10 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "hash/hash.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -375,6 +377,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // prefix pin held by the current task (empty if none), released in callback_on_reset
+    std::string prefix_id;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -439,7 +444,7 @@ struct server_slot {
     std::vector<uint64_t> n_accepted_per_pos;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
-    std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+    std::function<void(server_slot &)>       callback_on_reset; // called before reset()
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -928,6 +933,12 @@ public:
 
     // thread-safe, read directly by the HTTP threads
     server_storage_ops storage_ops;
+
+    // prefix pin counters, written by the main loop and read by the HTTP threads (/props, /prefixes)
+    std::atomic<int32_t> prefix_pins_max{0}; // 0 = disabled
+    std::atomic<int32_t> prefix_pins_max_tokens{0};
+    std::atomic<int32_t> prefix_pins_used{0};
+    std::atomic<int32_t> prefix_pins_used_tokens{0};
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -1423,10 +1434,23 @@ private:
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
-            slot.callback_on_reset = [this](const server_slot & slot) {
+            slot.callback_on_reset = [this](server_slot & slot) {
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
+                }
+
+                if (!slot.prefix_id.empty()) {
+                    // if the slot was released before decoding past the pin (cancel, abort) it still shares
+                    // the pin's recurrent cell, and a later partial seq_rm on the slot would roll that shared
+                    // cell back: drop the slot sequence. once a token past the pin is decoded, find_slot()
+                    // has already given the slot its own cell (copy on write)
+                    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    if (pos_max < (llama_pos) prefix_pins->get(slot.prefix_id)->n_tokens()) {
+                        slot.prompt_clear();
+                    }
+                    prefix_pins->release(slot.prefix_id);
+                    slot.prefix_id.clear();
                 }
             };
 
@@ -1559,6 +1583,8 @@ private:
             SRV_INF("prefix pins enabled, max = %d, max tokens = %d, reserved seq ids [%d, %d)\n",
                     params_base.prefix_pins, params_base.prefix_pin_max_tokens,
                     params_base.n_parallel, params_base.n_parallel + params_base.prefix_pins);
+            prefix_pins_max        = params_base.prefix_pins;
+            prefix_pins_max_tokens = params_base.prefix_pin_max_tokens;
         }
 
         {
@@ -1821,6 +1847,127 @@ private:
         return output;
     }
 
+    //
+    // prefix pins (main loop only)
+    //
+
+    void update_prefix_pin_counters() {
+        prefix_pins_used        = (int32_t) prefix_pins->n_used();
+        prefix_pins_used_tokens = (int32_t) prefix_pins->n_used_tokens();
+    }
+
+    void send_prefix_pin_error(const server_task & task, server_prefix_pin_error err) {
+        switch (err) {
+            case SERVER_PREFIX_PIN_OK:              GGML_ABORT("not an error");
+            case SERVER_PREFIX_PIN_CAPACITY_SEQS:   send_error(task, "no free prefix pin sequence", ERROR_TYPE_PREFIX_CAPACITY); break;
+            case SERVER_PREFIX_PIN_CAPACITY_TOKENS: send_error(task, "prefix pins would exceed --prefix-pin-max-tokens", ERROR_TYPE_PREFIX_CAPACITY); break;
+            case SERVER_PREFIX_PIN_HAS_CHILDREN:    send_error(task, "prefix pin has children", ERROR_TYPE_PREFIX_HAS_CHILDREN); break;
+            case SERVER_PREFIX_PIN_IN_USE:          send_error(task, "prefix pin is used by a running request", ERROR_TYPE_PREFIX_IN_USE); break;
+            case SERVER_PREFIX_PIN_NOT_FOUND:       send_error(task, "prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND); break;
+            case SERVER_PREFIX_PIN_BAD_PARENT:      send_error(task, "parent prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND); break;
+            case SERVER_PREFIX_PIN_EMPTY_TOKENS:    send_error(task, "tokens must not be empty", ERROR_TYPE_PREFIX_INVALID_TOKENS); break;
+        }
+    }
+
+    // sha256 of the token ids, each one as 4 bytes int32 little-endian
+    static std::string prefix_pin_tokens_sha256(const std::vector<int32_t> & tokens) {
+        std::vector<uint8_t> bytes;
+        bytes.reserve(tokens.size() * 4);
+        for (const int32_t tok : tokens) {
+            const uint32_t u = (uint32_t) tok;
+            bytes.insert(bytes.end(), { (uint8_t) u, (uint8_t) (u >> 8), (uint8_t) (u >> 16), (uint8_t) (u >> 24) });
+        }
+        return hash_sha256_hex(bytes.data(), bytes.size());
+    }
+
+    // fills the pin sequence: a child starts as a copy of its parent and processes only its own tokens
+    // no output is requested, so nothing is sampled; on failure the pin sequence is left empty
+    // decoding here without yield_to_queue is safe: process_single_task declines this task while a decode yields
+    bool prefill_prefix_pin(const server_prefix_pin & pin) {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        const size_t n_parent = pin.n_tokens() - pin.n_own;
+
+        if (!pin.parent.empty()) {
+            llama_memory_seq_cp(mem, prefix_pins->get(pin.parent)->seq_id, pin.seq_id, -1, -1);
+        }
+
+        common_set_adapter_lora(ctx_tgt, params_base.lora_adapters);
+        llama_set_embeddings(ctx_tgt, false);
+
+        // text tokens with one position each, like server_batch::render(): llama_batch_allocr broadcasts
+        // the position to all sections for M-RoPE / IMROPE models
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        llama_batch pb = llama_batch_init(n_batch, 0, 1);
+        int32_t ret = 0;
+        for (size_t i = n_parent; i < pin.n_tokens() && ret == 0;) {
+            common_batch_clear(pb);
+            for (; i < pin.n_tokens() && pb.n_tokens < n_batch; i++) {
+                common_batch_add(pb, pin.tokens[i], (llama_pos) i, { pin.seq_id }, false);
+            }
+            ret = llama_decode(ctx_tgt, pb);
+            // no free KV cells: purge idle slot caches (never a pin) and retry, like decode() does
+            while (ret == 1 && try_clear_idle_slots()) {
+                ret = llama_decode(ctx_tgt, pb);
+            }
+        }
+        llama_batch_free(pb);
+
+        if (ret != 0) {
+            SRV_ERR("prefix pin prefill failed, prefix_id = %s, ret = %d\n", pin.id.c_str(), ret);
+            llama_memory_seq_rm(mem, pin.seq_id, -1, -1);
+            return false;
+        }
+        llama_synchronize(ctx_tgt);
+        return true;
+    }
+
+    // validates the /completion prefix pin contract and starts the slot from the pin
+    // the slot gets its own copy of the pin sequence: attention cells are shared (positions below the
+    // pin are never removed or shifted for the slot), recurrent state is copied on write by find_slot()
+    bool start_from_prefix_pin(server_slot & slot, const server_task & task) {
+        const auto fail = [&](const std::string & msg, error_type type) {
+            send_error(task, msg, type);
+            return false;
+        };
+        if (!prefix_pins) {
+            return fail("prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+        }
+        if (task.id_slot < 0) {
+            return fail("prefix_id requires id_slot", ERROR_TYPE_PREFIX_REQUIRES_SLOT);
+        }
+        if (!task.params.cache_prompt) {
+            return fail("prefix_id requires cache_prompt", ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT);
+        }
+        const server_prefix_pin * pin = prefix_pins->get(task.prefix_id);
+        if (!pin) {
+            return fail("prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND);
+        }
+        if (task.tokens.size() <= pin->n_tokens()) {
+            return fail("the prompt must have at least one token after the prefix pin", ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT);
+        }
+        for (size_t i = 0; i < pin->n_tokens(); i++) {
+            if (task.tokens[i] != pin->tokens[i]) {
+                return fail(string_format("prompt differs from the prefix pin at token %zu", i), ERROR_TYPE_PREFIX_MISMATCH);
+            }
+        }
+        // the cells of the pin chain are shared with the slot, the other pins hold their own cells
+        const size_t n_other = prefix_pins->n_used_tokens() - pin->n_tokens();
+        if (task.tokens.size() + n_other > (size_t) slot.n_ctx) {
+            return fail(string_format("prompt (%zu tokens) + other prefix pins (%zu tokens) exceed the context (%d tokens)",
+                        task.tokens.size(), n_other, slot.n_ctx), ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
+        }
+
+        prefix_pins->acquire(task.prefix_id);
+        slot.prefix_id = task.prefix_id;
+
+        slot.prompt_clear(); // also drops the checkpoints
+        slot.mem.seq_cp(pin->seq_id, slot.id, -1, -1);
+        slot.prompt.tokens = server_tokens(pin->tokens, slot.prompt.tokens.has_mtmd);
+
+        SLT_INF(slot, "starting from prefix pin %s, n_tokens = %zu\n", pin->id.c_str(), pin->n_tokens());
+        return true;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -1933,6 +2080,12 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        // last check: nothing below can fail, so the acquired pin is always released by slot.release()
+        if (!task.prefix_id.empty() && !start_from_prefix_pin(slot, task)) {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            return false;
+        }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2990,6 +3143,95 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PREFIX_CREATE:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    const auto & act = task.prefix_action;
+                    const server_tokens tokens(act.tokens, false);
+                    if (!tokens.validate(ctx_tgt)) {
+                        send_error(task, "tokens contain invalid token ids", ERROR_TYPE_PREFIX_INVALID_TOKENS);
+                        break;
+                    }
+                    const auto created = prefix_pins->create(act.parent, act.tokens);
+                    if (created.error != SERVER_PREFIX_PIN_OK) {
+                        send_prefix_pin_error(task, created.error);
+                        break;
+                    }
+                    // all pins hold their cells at once, and a slot needs the whole chain of the pin it uses
+                    const size_t n_used_tokens = prefix_pins->n_used_tokens();
+                    if (n_used_tokens >= (size_t) n_ctx_slot()) {
+                        prefix_pins->remove(created.id);
+                        send_error(task, string_format("prefix pins (%zu tokens with this one) leave no room in the context (%d tokens)",
+                                   n_used_tokens, n_ctx_slot()), ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
+                        break;
+                    }
+                    const server_prefix_pin & pin = *prefix_pins->get(created.id);
+                    if (!prefill_prefix_pin(pin)) {
+                        prefix_pins->remove(created.id);
+                        send_error(task, "prefix pin prefill failed", ERROR_TYPE_PREFIX_PREFILL_FAILED);
+                        break;
+                    }
+                    update_prefix_pin_counters();
+                    SRV_INF("created prefix pin %s, parent = '%s', n_tokens = %zu, seq_id = %d\n",
+                            pin.id.c_str(), pin.parent.c_str(), pin.n_tokens(), pin.seq_id);
+
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id   = task.id;
+                    res->data = {
+                        {"prefix_id", pin.id},
+                        {"n_tokens",  pin.n_tokens()},
+                        {"parent",    pin.parent.empty() ? json(nullptr) : json(pin.parent)},
+                        {"kv_cells",  pin.kv_cells()},
+                    };
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PREFIX_DELETE:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    const server_prefix_pin * pin = prefix_pins->get(task.prefix_action.id);
+                    const llama_seq_id seq_id = pin ? pin->seq_id : -1;
+                    const auto err = prefix_pins->remove(task.prefix_action.id);
+                    if (err != SERVER_PREFIX_PIN_OK) {
+                        send_prefix_pin_error(task, err);
+                        break;
+                    }
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, -1, -1);
+                    update_prefix_pin_counters();
+                    SRV_INF("deleted prefix pin %s, seq_id = %d\n", task.prefix_action.id.c_str(), seq_id);
+
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PREFIX_LIST:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    json list = json::array();
+                    for (const auto & pin : prefix_pins->list()) {
+                        list.push_back({
+                            {"prefix_id",     pin.id},
+                            {"n_tokens",      pin.n_tokens()},
+                            {"parent",        pin.parent.empty() ? json(nullptr) : json(pin.parent)},
+                            {"children",      pin.children},
+                            {"in_use",        pin.n_in_use > 0},
+                            {"kv_cells",      pin.kv_cells()},
+                            {"tokens_sha256", prefix_pin_tokens_sha256(pin.tokens)},
+                        });
+                    }
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id   = task.id;
+                    res->data = std::move(list);
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -4596,6 +4838,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
+            // prefix pins are only offered on the native completion endpoint
+            if (type == SERVER_TASK_TYPE_COMPLETION && res_type == TASK_RESPONSE_TYPE_NONE && data.contains("prefix_id")) {
+                if (!data.at("prefix_id").is_string()) {
+                    throw std::invalid_argument("\"prefix_id\" must be a string");
+                }
+                task.prefix_id = data.at("prefix_id").get<std::string>();
+            }
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
@@ -5146,13 +5396,58 @@ void server_routes::init_routes() {
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
+        json props;
         if (queue_tasks.is_sleeping()) {
             std::unique_lock<std::mutex> lock(mutex_cache);
-            res->ok(cached_props);
+            props = cached_props;
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            props = get_res_props(*meta, params, false);
         }
+        // atomic counters of the main loop, never the registry (pins are refused with sleep, so these are 0 then)
+        const int32_t max = ctx_server.prefix_pins_max;
+        props["prefix_pins"] = {
+            {"enabled",     max > 0},
+            {"max",         max},
+            {"used",        ctx_server.prefix_pins_used.load()},
+            {"max_tokens",  ctx_server.prefix_pins_max_tokens.load()},
+            {"used_tokens", ctx_server.prefix_pins_used_tokens.load()},
+        };
+        res->ok(props);
         return res;
+    };
+
+    this->get_prefixes = [this](const server_http_req & req) {
+        return handle_prefix_task(req, server_task(SERVER_TASK_TYPE_PREFIX_LIST), 200);
+    };
+
+    this->post_prefixes = [this](const server_http_req & req) {
+        server_task task(SERVER_TASK_TYPE_PREFIX_CREATE);
+        if (ctx_server.prefix_pins_max > 0) {
+            const json body = json::parse(req.body);
+            const json tokens = json_value(body, "tokens", json());
+            const auto is_token_id = [](const json & t) {
+                return t.is_number_integer() && t.get<int64_t>() >= 0 && t.get<int64_t>() <= INT32_MAX;
+            };
+            if (!tokens.is_array() || !std::all_of(tokens.begin(), tokens.end(), is_token_id)) {
+                auto res = create_response();
+                res->error(format_error_response("\"tokens\" must be an array of token ids", ERROR_TYPE_PREFIX_INVALID_TOKENS));
+                return res;
+            }
+            task.prefix_action.tokens = tokens.get<llama_tokens>();
+            if (body.contains("parent") && !body.at("parent").is_null()) {
+                if (!body.at("parent").is_string()) {
+                    throw std::invalid_argument("\"parent\" must be a string");
+                }
+                task.prefix_action.parent = body.at("parent").get<std::string>();
+            }
+        }
+        return handle_prefix_task(req, std::move(task), 201);
+    };
+
+    this->delete_prefix = [this](const server_http_req & req) {
+        server_task task(SERVER_TASK_TYPE_PREFIX_DELETE);
+        task.prefix_action.id = req.get_param("id");
+        return handle_prefix_task(req, std::move(task), 204);
     };
 
     this->post_props = [this](const server_http_req &) {
@@ -5765,6 +6060,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
         return res;
     }
     return storage_op_run(std::move(res), std::move(task), req);
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_prefix_task(const server_http_req & req, server_task && task, int status_ok) {
+    auto res = create_response();
+    if (ctx_server.prefix_pins_max == 0) {
+        res->error(format_error_response("prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED));
+        return res;
+    }
+
+    task.id = res->rd.get_new_id();
+    res->rd.post_task(std::move(task));
+
+    auto result = res->rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    res->status = status_ok;
+    if (status_ok == 204) {
+        res->data.clear();
+    }
+    return res;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
