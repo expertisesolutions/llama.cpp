@@ -117,6 +117,8 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     override_kv: str | None = None
+    prefix_pins: int | None = None
+    prefix_pin_max_tokens: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -292,6 +294,10 @@ class ServerProcess:
             server_args.extend(["--cache-ram", self.cache_ram])
         if self.override_kv:
             server_args.extend(["--override-kv", self.override_kv])
+        if self.prefix_pins is not None:
+            server_args.extend(["--prefix-pins", self.prefix_pins])
+        if self.prefix_pin_max_tokens is not None:
+            server_args.extend(["--prefix-pin-max-tokens", self.prefix_pin_max_tokens])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
