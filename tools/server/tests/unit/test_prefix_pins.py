@@ -314,3 +314,42 @@ def test_usage_contract():
     assert error_type(res) == "invalid_tokens"
 
     assert list_pins()[pid]["in_use"] is False
+
+
+LORA_FILE_URL = "https://huggingface.co/ggml-org/stories15M_MOE/resolve/main/moe_shakespeare15M.gguf"
+
+
+def test_pin_bound_to_lora_config():
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.lora_files = [download_file(LORA_FILE_URL)]
+    server.kv_unified = True
+    server.cache_ram = 0
+    server.prefix_pins = 2
+    server.start()
+    T = tokenize(PIN_TEXT)
+    U = tokenize(SUFFIX_1)
+    # the pin is prefilled with the global adapter config (scale 1.0)
+    pid = create_pin(T).body["prefix_id"]
+    assert complete(T + U, prefix_id=pid).status_code == 200
+
+    # per-request scale that differs from the pin
+    res = complete(T + U, prefix_id=pid, lora=[{"id": 0, "scale": 0.0}])
+    assert res.status_code == 400
+    assert error_type(res) == "prefix_lora_mismatch"
+    assert list_pins()[pid]["in_use"] is False
+    # per-request scale equal to the pin
+    assert complete(T + U, prefix_id=pid, lora=[{"id": 0, "scale": 1.0}]).status_code == 200
+
+    # global default changed after the pin was created
+    assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.0}]).status_code == 200
+    res = complete(T + U, prefix_id=pid)
+    assert res.status_code == 400
+    assert error_type(res) == "prefix_lora_mismatch"
+    # a child would be prefilled with another config than its parent
+    res = create_pin(U, parent=pid)
+    assert res.status_code == 400
+    assert error_type(res) == "prefix_lora_mismatch"
+    # a request without pin is not affected
+    assert complete(T + U).status_code == 200
+

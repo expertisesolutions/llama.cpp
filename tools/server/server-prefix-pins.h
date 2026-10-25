@@ -37,6 +37,7 @@ struct server_prefix_pin {
     int32_t                  seq_id   = -1;
     std::vector<std::string> children; // in creation order
     int32_t                  n_in_use = 0; // requests currently holding the pin
+    std::vector<float>       lora_scales;  // adapter scales used at prefill, index = adapter id
 
     size_t n_tokens() const { return tokens.size(); }
     size_t kv_cells() const { return n_own; }
@@ -53,7 +54,8 @@ public:
         : n_parallel(n_parallel), max_tokens(max_tokens), seq_used(max_pins, false), rng(std::random_device{}()) {}
 
     // tokens are the tokens added after the parent (the whole prefix for a root pin)
-    server_prefix_pin_result create(const std::string & parent, const std::vector<int32_t> & tokens) {
+    server_prefix_pin_result create(const std::string & parent, const std::vector<int32_t> & tokens,
+                                    const std::vector<float> & lora_scales = {}) {
         if (tokens.empty()) {
             return { SERVER_PREFIX_PIN_EMPTY_TOKENS, "" };
         }
@@ -81,6 +83,7 @@ public:
         }
         pin.tokens.insert(pin.tokens.end(), tokens.begin(), tokens.end());
         pin.n_own  = tokens.size();
+        pin.lora_scales = lora_scales;
         pin.seq_id = n_parallel + (int32_t) (free_seq - seq_used.begin());
 
         *free_seq    = true;
