@@ -1377,6 +1377,14 @@ When `--api-key` is set, the `/prefixes` routes need the same key as the other r
 
 Extra sequences cost a fixed amount of memory at startup. On the Qwen hybrid model measured on a P100, each extra sequence costs about 150 MiB, almost all in the recurrent state. A pin does not allocate a context-sized KV cache. It uses only the KV cells of its own tokens inside the unified pool. Requests share that pool, so the tokens held by pins reduce the room for prompts. Every request, with or without `prefix_id`, must fit in the slot context minus the tokens held by the pins (the chain of the pin used by the request is not counted twice). A request without `prefix_id` that does not fit gets the usual `exceed_context_size_error`, and generation stops at that limit.
 
+### Limitations
+
+`POST /prefixes` fills the pin in one call that cannot be interrupted. While it runs, the server does not serve other requests, and the client cannot cancel it. If the client gives up and closes the connection, the server still finishes the prefill. The next ordinary completion waits behind it. The pin it creates stays on the server until a client deletes it, so a client that gave up may leave an orphan pin and must list the pins to find it.
+
+Typical times on a P100, about 134 prompt tokens per second: a pin of 760 to 870 tokens takes about 6 s. The worst case measured was about 25 s, for the first judgment after a server restart, which creates two pins (L0 and L1). The hard upper bound is `--prefix-pin-max-tokens` (default 8192), about 60 s. Keep this value as low as the use case allows.
+
+Pins are created once per policy and again after a server restart, not once per request. A prefill that can be cancelled, or that works in steps, is not implemented.
+
 ### What pins do not do
 
 - The server does not choose a prefix. The client sends `prefix_id` in each request.

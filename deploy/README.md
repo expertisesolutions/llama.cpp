@@ -65,6 +65,8 @@ The permission judge runs one `llama-server` per P100 GPU with these parameters:
 
 `--prefix-pins 0` turns the feature off. Then the server behaves as before.
 
+Creating a pin prefills it in one call that cannot be cancelled and blocks the server for its duration (about 6 s for a typical pin, up to about 60 s at the default `--prefix-pin-max-tokens`). See "Limitations" in the prefix pins section of `tools/server/README.md`.
+
 See "Prefix pins" in `tools/server/README.md` for the flags, the startup rules, and the HTTP API.
 
 Measurements that need the real model on the P100 test GPU (latency, hit rate, equivalence of results) are to be measured (tasks 9 and 10).
