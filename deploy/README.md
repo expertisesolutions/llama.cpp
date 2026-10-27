@@ -7,7 +7,7 @@ This directory holds the container recipes for the llama-server images of the P1
 The source of every image is the branch `storage-operations`.
 Commit: commit X (filled in when pin/prefix-pins is merged into storage-operations).
 
-The P100 image and the 3090 image compile the same tree. There are no patch files and no `patch -p1` step in the recipes. All earlier patches are commits in the branch.
+The P100 image and the 3090 image compile the same tree. The recipes apply no patches: all earlier patches are commits in the branch.
 
 The two builds differ only in build parameters:
 
