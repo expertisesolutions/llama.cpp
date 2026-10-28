@@ -27,6 +27,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_PREFIX_CREATE,
+    SERVER_TASK_TYPE_PREFIX_DELETE,
+    SERVER_TASK_TYPE_PREFIX_LIST,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -172,6 +175,18 @@ struct server_task {
         std::string operation_id;         // restore / erase identity, empty for save
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_PREFIX_CREATE, SERVER_TASK_TYPE_PREFIX_DELETE
+    struct prefix_action {
+        std::string  id;     // delete only
+        std::string  parent; // create only, empty for a root pin
+        llama_tokens tokens; // create only, the tokens added after the parent
+    };
+    prefix_action prefix_action;
+
+    // used by SERVER_TASK_TYPE_COMPLETION (/completion only): start from this prefix pin
+    // note: not copied to child tasks, only the parent slot holds the pin
+    std::string prefix_id;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -548,6 +563,15 @@ struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
     virtual json to_json() override;
+};
+
+// used by /prefixes API
+struct server_task_result_prefix : server_task_result {
+    json data; // created pin (create), pin list (list), null (delete)
+
+    virtual json to_json() override {
+        return data;
+    }
 };
 
 struct server_task_result_control : server_task_result {

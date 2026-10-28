@@ -704,6 +704,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    q8_1_cache_free();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -3273,6 +3275,193 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Sibling fusion: merge a run of identically shaped nodes to cut the number of launches.
+// Unlike topk-moe or rope+set_rows this removes no intermediate node -- every node is still
+// computed -- so the only requirement is that reordering them cannot change the result: the
+// destinations must not overlap each other, nor any other node's source.  That is checked here as
+// byte ranges.
+static bool ggml_cuda_fuse_nodes_disjoint(ggml_tensor ** nodes, int n, int dst_src_idx) {
+    auto range_of = [](const ggml_tensor * t, const char *& beg, const char *& end) {
+        beg = (const char *) t->data;
+        end = beg + ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+    };
+    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
+            return true; // anything we cannot decide counts as overlapping, i.e. do not fuse
+        }
+        const char * as; const char * ae; const char * bs; const char * be;
+        range_of(a, as, ae);
+        range_of(b, bs, be);
+        return as < be && bs < ae;
+    };
+
+    for (int a = 0; a < n; ++a) {
+        // dst_src_idx >= 0 means src[dst_src_idx] is the destination (CPY); otherwise the node
+        // itself is the destination (L2_NORM)
+        const ggml_tensor * dst_a = dst_src_idx >= 0 ? nodes[a]->src[dst_src_idx] : nodes[a];
+        if (!dst_a) {
+            return false;
+        }
+        for (int b = 0; b < n; ++b) {
+            if (a == b) {
+                continue;
+            }
+            const ggml_tensor * dst_b = dst_src_idx >= 0 ? nodes[b]->src[dst_src_idx] : nodes[b];
+            if (overlap(dst_a, dst_b)) {
+                return false;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                const ggml_tensor * src_b = nodes[b]->src[s];
+                if (!src_b) {
+                    continue;
+                }
+                if (dst_src_idx >= 0 && s == dst_src_idx) {
+                    continue; // destination-vs-destination was handled above
+                }
+                if (overlap(dst_a, src_b)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// Recover the index of the last accepted node after nodes[] has been compacted
+static int ggml_cuda_node_index_of(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return from;
+}
+
+// Diagnostics for when fusion does not fire.  GGML_CUDA_FUSE_LOG=2 dumps the neighbourhood of the
+// candidate nodes and the outcome of each test.  The assumption "nodes with the same op are
+// adjacent" is easily broken by no-ops and by allocation order, and without this a failure costs a
+// full build-and-trace cycle to diagnose.
+static void ggml_cuda_fuse_diag(const ggml_cgraph * cgraph, int i, int collected, int disjoint, int launched) {
+    static int level   = getenv("GGML_CUDA_FUSE_LOG") ? std::atoi(getenv("GGML_CUDA_FUSE_LOG")) : 0;
+    static int printed = 0;
+    if (level < 2 || printed++ >= 12) {
+        return;
+    }
+    char   buf[512];
+    size_t p = 0;
+    for (int j = i; j < cgraph->n_nodes && j < i + 8 && p + 64 < sizeof(buf); ++j) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%s%s[f%x]", j == i ? "" : " -> ",
+                      ggml_op_name(cgraph->nodes[j]->op), (unsigned) cgraph->nodes[j]->flags);
+    }
+    GGML_LOG_INFO("ggml_cuda_fuse_diag: i=%d collected=%d disjoint=%d launched=%d | %s\n",
+                  i, collected, disjoint, launched, buf);
+}
+
+// Fire confirmation: with GGML_CUDA_FUSE_LOG=1, print the first few firings (budget shared across
+// rules), so that "did it fire at all"
+// can be answered without running a profiler.
+static void ggml_cuda_fuse_log(const char * rule, int n) {
+    static bool enabled = getenv("GGML_CUDA_FUSE_LOG") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_LOG"));
+    if (!enabled) {
+        return;
+    }
+    static int printed = 0;
+    if (printed++ < 8) {
+        GGML_LOG_INFO("ggml_cuda_fuse: %s x%d\n", rule, n);
+    }
+}
+
+// Collect a run of up to max_n consecutive nodes with the same op and return the index of the last
+// one in *last_idx.  No-ops (view / reshape / permute) are skipped by the main loop, so they are
+// ignored here too.  Missing that makes fusion never fire on any graph that routes through
+// ggml_view_* -- which is exactly what Qwen3.5's conv state and q/k l2_norm do.
+static int ggml_cuda_collect_same_op(ggml_cgraph * cgraph, int i, ggml_op op, int max_n,
+                                     ggml_tensor ** out, int * last_idx) {
+    int n = 0;
+    *last_idx = i;
+    for (int j = i; j < cgraph->n_nodes && n < max_n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        // Nodes the main loop skips (no-ops, non-COMPUTE) are not fusion candidates either
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != op) {
+            break;
+        }
+        out[n++]  = node;
+        *last_idx = j;
+    }
+    return n;
+}
+
+// If ops[0..n) appear in this order (skipping no-ops), record their positions in idxs and return true
+static bool ggml_cuda_collect_ops(ggml_cgraph * cgraph, int i, const ggml_op * ops, int n, int * idxs) {
+    int k = 0;
+    for (int j = i; j < cgraph->n_nodes && k < n; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node->op != ops[k]) {
+            return false;
+        }
+        idxs[k++] = j;
+    }
+    return k == n;
+}
+
+// Can the residual add be folded into rms_norm's prologue?
+// The kernel maps one row to one block and consumes the sum within that block, so the only
+// requirements are: rms_norm's input is exactly the preceding ADD, there is no broadcasting,
+// and all three tensors are contiguous.  The ADD's output is still written because the next
+// layer reads it as its residual (the caller lists it in outputs).
+static bool ggml_cuda_should_fuse_pre_add_rms_norm(const ggml_tensor * add, const ggml_tensor * rms_norm) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    if (rms_norm->src[0] != add) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || !add->src[0] || !add->src[1] ||
+        add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1])) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+        return false;
+    }
+    return true;
+}
+
+// The same conditions upstream's {RMS_NORM, MUL} fusion checks inside ggml_cuda_can_fuse,
+// factored out so they also work when the node indices are not consecutive
+static bool ggml_cuda_should_fuse_rms_norm_mul(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+        return false;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Broadcasting is not handled when rms_norm is the B operand (same as upstream)
+    if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3294,6 +3483,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // Merge runs of identically shaped CPY / L2_NORM nodes into one launch each
+    if (node->op == GGML_OP_CPY) {
+        static bool disable_cpy = getenv("GGML_CUDA_DISABLE_FUSE_CPY") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_CPY"));
+        if (!disable_cpy) {
+            ggml_tensor * nodes[CUDA_CPY_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_CPY, CUDA_CPY_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ 1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_cpy_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("cpy", n);
+                return last_idx - i;
+            }
+        }
+    }
+
+    // Fuse the residual add into RMS_NORM: ADD -> RMS_NORM -> MUL in one launch.  The
+    // `k_bin_bcast(add) -> rms_norm` pair is 3.11% of decode GPU time.  Upstream only fuses what
+    // comes AFTER rms_norm (mul / add); the preceding residual add passed through untouched.
+    //
+    // Off by default.  This fusion (and 20's add+unary+mul) writes the ADD's `dst` while its own
+    // prologue still reads `add->src[0]`/`src[1]` in the same kernel that the epilogue uses to
+    // write the MUL's `dst` -- neither goes through `ggml_cuda_check_fusion_memory_ranges`, so
+    // ggml-alloc can carve the MUL output out of the ADD inputs' just-freed block and have one
+    // invocation's epilogue write land on memory a different invocation's prologue still needs to
+    // read. This produced non-deterministic MoE decode output on Tesla P100 (same seed, three
+    // runs, three different outputs); gating on "graph contains MUL_MAT_ID" is not sufficient
+    // either, since backend scheduler splits can put the MUL_MAT_ID on a different (e.g. CPU)
+    // split and leave this fusion's view of the graph looking dense. The real fix is upstream's
+    // own memory-range check; until then this only runs when explicitly requested.
+    if (node->op == GGML_OP_ADD) {
+        static bool enable_pre_add = getenv("GGML_CUDA_FUSE_PRE_ADD") != nullptr &&
+                                     std::atoi(getenv("GGML_CUDA_FUSE_PRE_ADD"));
+        if (enable_pre_add) {
+            static const ggml_op pre_add_ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, pre_add_ops, 3, idxs)) {
+                ggml_tensor * add = cgraph->nodes[idxs[0]];
+                ggml_tensor * rms = cgraph->nodes[idxs[1]];
+                ggml_tensor * mul = cgraph->nodes[idxs[2]];
+                // The ADD output is the next layer's residual and the MUL output is the final
+                // result; neither is eliminated, so both are listed in outputs
+                const int outs[2] = { idxs[0], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, pre_add_ops, outs, 2) &&
+                    ggml_cuda_should_fuse_pre_add_rms_norm(add, rms) &&
+                    ggml_cuda_should_fuse_rms_norm_mul(rms, mul)) {
+                    ggml_cuda_op_rms_norm_fused_pre_add(*cuda_ctx, add, rms, mul);
+                    ggml_cuda_fuse_log("pre_add_rms_norm", 3);
+                    return idxs[2] - i;
+                }
+            }
+        }
+    }
+
+    // Fuse ADD -> UNARY -> MUL into one launch (Qwen3.5's gate preprocessing).  These three
+    // launches are 0.65% of decode GPU time, dominated by launch overhead rather than work.
+    //
+    // Off by default: same unguarded-memory-range hazard as 19's pre-add fusion above (its
+    // prologue reads the bias add's inputs in the same kernel that writes the ADD's `dst`,
+    // without going through `ggml_cuda_check_fusion_memory_ranges`) -- see the comment there.
+    if (node->op == GGML_OP_ADD) {
+        static bool enable_aum = getenv("GGML_CUDA_FUSE_ADD_UNARY_MUL") != nullptr &&
+                                 std::atoi(getenv("GGML_CUDA_FUSE_ADD_UNARY_MUL"));
+        if (enable_aum) {
+            static const ggml_op aum_ops[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+            int idxs[3];
+            if (ggml_cuda_collect_ops(cgraph, i, aum_ops, 3, idxs)) {
+                // All three destinations are written, so nothing is eliminated: list them all
+                // in outputs
+                const int outs[3] = { idxs[0], idxs[1], idxs[2] };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, aum_ops, outs, 3) &&
+                    ggml_cuda_op_fused_add_unary_mul(*cuda_ctx, cgraph->nodes[idxs[0]],
+                                                     cgraph->nodes[idxs[1]], cgraph->nodes[idxs[2]])) {
+                    ggml_cuda_fuse_log("add_unary_mul", 3);
+                    return idxs[2] - i;
+                }
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_L2_NORM) {
+        static bool disable_l2 = getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM") != nullptr &&
+                                 std::atoi(getenv("GGML_CUDA_DISABLE_FUSE_L2_NORM"));
+        if (!disable_l2) {
+            ggml_tensor * nodes[CUDA_L2_NORM_FUSE_MAX];
+            int last_idx = i;
+            int n = ggml_cuda_collect_same_op(cgraph, i, GGML_OP_L2_NORM, CUDA_L2_NORM_FUSE_MAX, nodes, &last_idx);
+            const int collected = n;
+            while (n >= 2 && !ggml_cuda_fuse_nodes_disjoint(nodes, n, /*dst_src_idx =*/ -1)) {
+                --n;
+                last_idx = ggml_cuda_node_index_of(cgraph, i, nodes[n - 1]);
+            }
+            const bool launched = n >= 2 && ggml_cuda_l2_norm_fused(*cuda_ctx, nodes, n);
+            ggml_cuda_fuse_diag(cgraph, i, collected, n, launched);
+            if (launched) {
+                ggml_cuda_fuse_log("l2_norm", n);
+                return last_idx - i;
+            }
         }
     }
 
@@ -4249,6 +4545,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // The q8_1 activation cache keys on a tensor pointer, which a later graph may
+    // reuse for a different tensor, so it must not outlive the graph that filled it
+    cuda_ctx->q8_1_cache_clear();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4844,6 +5144,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
         /* .mmap_support          = */ props->type != GGML_BACKEND_DEVICE_TYPE_IGPU,
+        /* .copy_stream           = */ true,
     };
 }
 

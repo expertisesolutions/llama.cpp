@@ -8,6 +8,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-storage-ops.h"
+#include "server-prefix-pins.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -18,8 +19,10 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "hash/hash.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -374,6 +377,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // prefix pin held by the current task (empty if none), released in callback_on_reset
+    std::string prefix_id;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -438,7 +444,7 @@ struct server_slot {
     std::vector<uint64_t> n_accepted_per_pos;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
-    std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+    std::function<void(server_slot &)>       callback_on_reset; // called before reset()
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -928,6 +934,12 @@ public:
     // thread-safe, read directly by the HTTP threads
     server_storage_ops storage_ops;
 
+    // prefix pin counters, written by the main loop and read by the HTTP threads (/props, /prefixes)
+    std::atomic<int32_t> prefix_pins_max{0}; // 0 = disabled
+    std::atomic<int32_t> prefix_pins_max_tokens{0};
+    std::atomic<int32_t> prefix_pins_used{0};
+    std::atomic<int32_t> prefix_pins_used_tokens{0};
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -994,6 +1006,9 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // prefix pins: reserved seq ids [n_parallel, n_parallel + prefix_pins), only set when --prefix-pins > 0
+    std::unique_ptr<server_prefix_pins> prefix_pins;
 
     server_metrics metrics;
 
@@ -1082,6 +1097,33 @@ private:
         return true;
     }
 
+    // prefix pins live in reserved sequences of the shared KV pool; refuse every option that could touch or drop them
+    static bool validate_prefix_pins(const common_params & params) {
+        if (params.prefix_pins <= 0) {
+            return true;
+        }
+        const char * err = nullptr;
+        if (!params.kv_unified) {
+            err = "prefix-pins requires --kv-unified";
+        } else if (params.cache_ram_mib != 0) {
+            err = "prefix-pins requires --cache-ram 0";
+        } else if (params.speculative.has_dft() ||
+                   // any type but none: "--spec-type none" appends to the default and yields {none, none}
+                   std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+                               [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+            err = "prefix-pins is incompatible with speculative decoding";
+        } else if (params.ctx_shift) {
+            err = "prefix-pins is incompatible with --context-shift";
+        } else if (params.sleep_idle_seconds > 0) {
+            err = "prefix-pins is incompatible with --sleep-idle-seconds";
+        }
+        if (err != nullptr) {
+            SRV_ERR("%s\n", err);
+            return false;
+        }
+        return true;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1095,6 +1137,10 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        if (params_base.prefix_pins > 0) {
+            // the output buffer is reserved for n_seq_max = n_parallel + prefix_pins sequences
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_parallel + params_base.prefix_pins);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1102,6 +1148,10 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        if (!validate_prefix_pins(params_base)) {
+            return false;
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1195,6 +1245,16 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // aLoRA keeps only the tokens before its invocation cached, which would cut into a pin (only known after load)
+        if (params_base.prefix_pins > 0) {
+            for (const auto & la : params_base.lora_adapters) {
+                if (llama_adapter_get_alora_n_invocation_tokens(la.ptr) > 0) {
+                    SRV_ERR("%s\n", "prefix-pins is incompatible with aLoRA adapters");
+                    return false;
+                }
+            }
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1384,10 +1444,23 @@ private:
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
-            slot.callback_on_reset = [this](const server_slot & slot) {
+            slot.callback_on_reset = [this](server_slot & slot) {
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
+                }
+
+                if (!slot.prefix_id.empty()) {
+                    // if the slot was released before decoding past the pin (cancel, abort) it still shares
+                    // the pin's recurrent cell, and a later partial seq_rm on the slot would roll that shared
+                    // cell back: drop the slot sequence. once a token past the pin is decoded, find_slot()
+                    // has already given the slot its own cell (copy on write)
+                    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    if (pos_max < (llama_pos) prefix_pins->get(slot.prefix_id)->n_tokens()) {
+                        slot.prompt_clear();
+                    }
+                    prefix_pins->release(slot.prefix_id);
+                    slot.prefix_id.clear();
                 }
             };
 
@@ -1512,6 +1585,16 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+
+        if (params_base.prefix_pins > 0) {
+            prefix_pins = std::make_unique<server_prefix_pins>(
+                    params_base.n_parallel, params_base.prefix_pins, (size_t) params_base.prefix_pin_max_tokens);
+            SRV_INF("prefix pins enabled, max = %d, max tokens = %d, reserved seq ids [%d, %d)\n",
+                    params_base.prefix_pins, params_base.prefix_pin_max_tokens,
+                    params_base.n_parallel, params_base.n_parallel + params_base.prefix_pins);
+            prefix_pins_max        = params_base.prefix_pins;
+            prefix_pins_max_tokens = params_base.prefix_pin_max_tokens;
         }
 
         {
@@ -1774,6 +1857,156 @@ private:
         return output;
     }
 
+    //
+    // prefix pins (main loop only)
+    //
+
+    // the KV/recurrent state of a pin depends on the adapters applied at prefill; index = adapter id
+    static std::vector<float> prefix_pin_lora_scales(const std::vector<common_adapter_lora_info> & loras) {
+        std::vector<float> res;
+        for (const auto & la : loras) {
+            res.push_back(la.scale);
+        }
+        return res;
+    }
+
+    // context left for the request of a slot. pins hold cells of the same pool as the slots (kv_unified:
+    // n_ctx_slot() is the whole n_ctx, or less with --kv-unified-per-slot), so every request must fit in
+    // n_ctx_slot() minus the tokens held by all pins; the chain of the pin used by the slot is shared with
+    // the slot and is not counted twice
+    int32_t n_ctx_avail(const server_slot & slot, const std::string & prefix_id) const {
+        if (!prefix_pins) {
+            return slot.n_ctx;
+        }
+        size_t n_pins = prefix_pins->n_used_tokens();
+        if (!prefix_id.empty()) {
+            n_pins -= prefix_pins->get(prefix_id)->n_tokens();
+        }
+        return slot.n_ctx - (int32_t) n_pins;
+    }
+
+    void update_prefix_pin_counters() {
+        prefix_pins_used        = (int32_t) prefix_pins->n_used();
+        prefix_pins_used_tokens = (int32_t) prefix_pins->n_used_tokens();
+    }
+
+    void send_prefix_pin_error(const server_task & task, server_prefix_pin_error err) {
+        switch (err) {
+            case SERVER_PREFIX_PIN_OK:              GGML_ABORT("not an error");
+            case SERVER_PREFIX_PIN_CAPACITY_SEQS:   send_error(task, "no free prefix pin sequence", ERROR_TYPE_PREFIX_CAPACITY); break;
+            case SERVER_PREFIX_PIN_CAPACITY_TOKENS: send_error(task, "prefix pins would exceed --prefix-pin-max-tokens", ERROR_TYPE_PREFIX_CAPACITY); break;
+            case SERVER_PREFIX_PIN_HAS_CHILDREN:    send_error(task, "prefix pin has children", ERROR_TYPE_PREFIX_HAS_CHILDREN); break;
+            case SERVER_PREFIX_PIN_IN_USE:          send_error(task, "prefix pin is used by a running request", ERROR_TYPE_PREFIX_IN_USE); break;
+            case SERVER_PREFIX_PIN_NOT_FOUND:       send_error(task, "prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND); break;
+            case SERVER_PREFIX_PIN_BAD_PARENT:      send_error(task, "parent prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND); break;
+            case SERVER_PREFIX_PIN_EMPTY_TOKENS:    send_error(task, "tokens must not be empty", ERROR_TYPE_PREFIX_INVALID_TOKENS); break;
+        }
+    }
+
+    // sha256 of the token ids, each one as 4 bytes int32 little-endian
+    static std::string prefix_pin_tokens_sha256(const std::vector<int32_t> & tokens) {
+        std::vector<uint8_t> bytes;
+        bytes.reserve(tokens.size() * 4);
+        for (const int32_t tok : tokens) {
+            const uint32_t u = (uint32_t) tok;
+            bytes.insert(bytes.end(), { (uint8_t) u, (uint8_t) (u >> 8), (uint8_t) (u >> 16), (uint8_t) (u >> 24) });
+        }
+        return hash_sha256_hex(bytes.data(), bytes.size());
+    }
+
+    // fills the pin sequence: a child starts as a copy of its parent and processes only its own tokens
+    // no output is requested, so nothing is sampled; on failure the pin sequence is left empty
+    // decoding here without yield_to_queue is safe: process_single_task declines this task while a decode yields
+    bool prefill_prefix_pin(const server_prefix_pin & pin) {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        const size_t n_parent = pin.n_tokens() - pin.n_own;
+
+        if (!pin.parent.empty()) {
+            llama_memory_seq_cp(mem, prefix_pins->get(pin.parent)->seq_id, pin.seq_id, -1, -1);
+        }
+
+        common_set_adapter_lora(ctx_tgt, params_base.lora_adapters);
+        llama_set_embeddings(ctx_tgt, false);
+
+        // text tokens with one position each, like server_batch::render(): llama_batch_allocr broadcasts
+        // the position to all sections for M-RoPE / IMROPE models
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        llama_batch pb = llama_batch_init(n_batch, 0, 1);
+        int32_t ret = 0;
+        for (size_t i = n_parent; i < pin.n_tokens() && ret == 0;) {
+            common_batch_clear(pb);
+            for (; i < pin.n_tokens() && pb.n_tokens < n_batch; i++) {
+                common_batch_add(pb, pin.tokens[i], (llama_pos) i, { pin.seq_id }, false);
+            }
+            ret = llama_decode(ctx_tgt, pb);
+            // no free KV cells: purge idle slot caches (never a pin) and retry, like decode() does
+            while (ret == 1 && try_clear_idle_slots()) {
+                ret = llama_decode(ctx_tgt, pb);
+            }
+        }
+        llama_batch_free(pb);
+
+        if (ret != 0) {
+            SRV_ERR("prefix pin prefill failed, prefix_id = %s, ret = %d\n", pin.id.c_str(), ret);
+            llama_memory_seq_rm(mem, pin.seq_id, -1, -1);
+            return false;
+        }
+        llama_synchronize(ctx_tgt);
+        return true;
+    }
+
+    // validates the /completion prefix pin contract and starts the slot from the pin
+    // the slot gets its own copy of the pin sequence: attention cells are shared (positions below the
+    // pin are never removed or shifted for the slot), recurrent state is copied on write by find_slot()
+    bool start_from_prefix_pin(server_slot & slot, const server_task & task) {
+        const auto fail = [&](const std::string & msg, error_type type) {
+            send_error(task, msg, type);
+            return false;
+        };
+        if (!prefix_pins) {
+            return fail("prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+        }
+        if (task.id_slot < 0) {
+            return fail("prefix_id requires id_slot", ERROR_TYPE_PREFIX_REQUIRES_SLOT);
+        }
+        if (!task.params.cache_prompt) {
+            return fail("prefix_id requires cache_prompt", ERROR_TYPE_PREFIX_REQUIRES_CACHE_PROMPT);
+        }
+        const server_prefix_pin * pin = prefix_pins->get(task.prefix_id);
+        if (!pin) {
+            return fail("prefix pin not found", ERROR_TYPE_PREFIX_NOT_FOUND);
+        }
+        if (task.tokens.size() <= pin->n_tokens()) {
+            return fail("the prompt must have at least one token after the prefix pin", ERROR_TYPE_PREFIX_PROMPT_TOO_SHORT);
+        }
+        for (size_t i = 0; i < pin->n_tokens(); i++) {
+            if (task.tokens[i] != pin->tokens[i]) {
+                return fail(string_format("prompt differs from the prefix pin at token %zu", i), ERROR_TYPE_PREFIX_MISMATCH);
+            }
+        }
+        // slot.lora is the effective adapter config of this request (per-request or global default)
+        if (prefix_pin_lora_scales(slot.lora) != pin->lora_scales) {
+            return fail("the adapter config of the request differs from the one used to create the prefix pin",
+                        ERROR_TYPE_PREFIX_LORA_MISMATCH);
+        }
+        // same rule as the prompt check in update_slots(), with the pin-specific error type
+        if ((int32_t) task.tokens.size() >= n_ctx_avail(slot, task.prefix_id)) {
+            return fail(string_format("prompt (%zu tokens) + other prefix pins (%zu tokens) exceed the context (%d tokens)",
+                        task.tokens.size(), prefix_pins->n_used_tokens() - pin->n_tokens(), slot.n_ctx),
+                        ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
+        }
+
+        prefix_pins->acquire(task.prefix_id);
+        slot.prefix_id = task.prefix_id;
+
+        slot.prompt_clear(); // also drops the checkpoints
+        slot.mem.seq_cp(pin->seq_id, slot.id, -1, -1);
+        slot.prompt.tokens = server_tokens(pin->tokens, slot.prompt.tokens.has_mtmd);
+
+        SLT_INF(slot, "starting from prefix pin %s, n_tokens = %zu\n", pin->id.c_str(), pin->n_tokens());
+        return true;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -1887,6 +2120,12 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        // last check: nothing below can fail, so the acquired pin is always released by slot.release()
+        if (!task.prefix_id.empty() && !start_from_prefix_pin(slot, task)) {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            return false;
+        }
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -1953,7 +2192,7 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= n_ctx_avail(slot, slot.prefix_id)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -2945,6 +3184,103 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_PREFIX_CREATE:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    const auto & act = task.prefix_action;
+                    const server_tokens tokens(act.tokens, false);
+                    if (!tokens.validate(ctx_tgt)) {
+                        send_error(task, "tokens contain invalid token ids", ERROR_TYPE_PREFIX_INVALID_TOKENS);
+                        break;
+                    }
+                    // a pin and its chain must be prefilled with the same adapter config
+                    const auto lora_scales = prefix_pin_lora_scales(params_base.lora_adapters);
+                    const server_prefix_pin * parent = prefix_pins->get(act.parent);
+                    if (parent && parent->lora_scales != lora_scales) {
+                        send_error(task, "the adapter config differs from the one used to create the parent prefix pin",
+                                   ERROR_TYPE_PREFIX_LORA_MISMATCH);
+                        break;
+                    }
+                    const auto created = prefix_pins->create(act.parent, act.tokens, lora_scales);
+                    if (created.error != SERVER_PREFIX_PIN_OK) {
+                        send_prefix_pin_error(task, created.error);
+                        break;
+                    }
+                    // all pins hold their cells at once, and a slot needs the whole chain of the pin it uses
+                    const size_t n_used_tokens = prefix_pins->n_used_tokens();
+                    if (n_used_tokens >= (size_t) n_ctx_slot()) {
+                        prefix_pins->remove(created.id);
+                        send_error(task, string_format("prefix pins (%zu tokens with this one) leave no room in the context (%d tokens)",
+                                   n_used_tokens, n_ctx_slot()), ERROR_TYPE_PREFIX_CONTEXT_EXCEEDED);
+                        break;
+                    }
+                    const server_prefix_pin & pin = *prefix_pins->get(created.id);
+                    if (!prefill_prefix_pin(pin)) {
+                        prefix_pins->remove(created.id);
+                        send_error(task, "prefix pin prefill failed", ERROR_TYPE_PREFIX_PREFILL_FAILED);
+                        break;
+                    }
+                    update_prefix_pin_counters();
+                    SRV_INF("created prefix pin %s, parent = '%s', n_tokens = %zu, seq_id = %d\n",
+                            pin.id.c_str(), pin.parent.c_str(), pin.n_tokens(), pin.seq_id);
+
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id   = task.id;
+                    res->data = {
+                        {"prefix_id", pin.id},
+                        {"n_tokens",  pin.n_tokens()},
+                        {"parent",    pin.parent.empty() ? json(nullptr) : json(pin.parent)},
+                        {"kv_cells",  pin.kv_cells()},
+                    };
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PREFIX_DELETE:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    const server_prefix_pin * pin = prefix_pins->get(task.prefix_action.id);
+                    const llama_seq_id seq_id = pin ? pin->seq_id : -1;
+                    const auto err = prefix_pins->remove(task.prefix_action.id);
+                    if (err != SERVER_PREFIX_PIN_OK) {
+                        send_prefix_pin_error(task, err);
+                        break;
+                    }
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, -1, -1);
+                    update_prefix_pin_counters();
+                    SRV_INF("deleted prefix pin %s, seq_id = %d\n", task.prefix_action.id.c_str(), seq_id);
+
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PREFIX_LIST:
+                {
+                    if (!prefix_pins) {
+                        send_error(task, "prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED);
+                        break;
+                    }
+                    json list = json::array();
+                    for (const auto & pin : prefix_pins->list()) {
+                        list.push_back({
+                            {"prefix_id",     pin.id},
+                            {"n_tokens",      pin.n_tokens()},
+                            {"parent",        pin.parent.empty() ? json(nullptr) : json(pin.parent)},
+                            {"children",      pin.children},
+                            {"in_use",        pin.n_in_use > 0},
+                            {"kv_cells",      pin.kv_cells()},
+                            {"tokens_sha256", prefix_pin_tokens_sha256(pin.tokens)},
+                        });
+                    }
+                    auto res = std::make_unique<server_task_result_prefix>();
+                    res->id   = task.id;
+                    res->data = std::move(list);
+                    queue_results.send(std::move(res));
+                } break;
         }
 
         return true;
@@ -3416,22 +3752,22 @@ private:
                                 return;
                             }
 
-                            if (slot.task->n_tokens() > slot.n_ctx) {
+                            if (slot.task->n_tokens() > n_ctx_avail(slot, slot.prefix_id)) {
                                 send_error(
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
+                                        slot.task->n_tokens(), n_ctx_avail(slot, slot.prefix_id)),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (slot.task->n_tokens() >= n_ctx_avail(slot, slot.prefix_id)) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         slot.task->n_tokens(), n_ctx_avail(slot, slot.prefix_id)),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
@@ -3449,9 +3785,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // with prefix pins, the shift would also move the KV cells that the slot shares with a pin
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    prefix_pins == nullptr;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -4254,7 +4592,8 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
-        return std::min(res, llama_model_n_ctx_train(model_tgt));
+        // ctxcap bypass: intencionalmente NAO cappa em n_ctx_train, pra permitir -c > n_ctx_train via YaRN (ex: 1M). Sem YaRN a qualidade degrada; warning em ~1232.
+        return res;
     }
 
     server_response_reader get_response_reader() {
@@ -4545,6 +4884,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
+
+            // prefix pins are only offered on the native completion endpoint
+            if (type == SERVER_TASK_TYPE_COMPLETION && res_type == TASK_RESPONSE_TYPE_NONE && data.contains("prefix_id")) {
+                if (!data.at("prefix_id").is_string()) {
+                    throw std::invalid_argument("\"prefix_id\" must be a string");
+                }
+                task.prefix_id = data.at("prefix_id").get<std::string>();
+            }
 
             // OAI-compat
             task.params.res_type          = res_type;
@@ -5096,13 +5443,58 @@ void server_routes::init_routes() {
     this->get_props = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
+        json props;
         if (queue_tasks.is_sleeping()) {
             std::unique_lock<std::mutex> lock(mutex_cache);
-            res->ok(cached_props);
+            props = cached_props;
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            props = get_res_props(*meta, params, false);
         }
+        // atomic counters of the main loop, never the registry (pins are refused with sleep, so these are 0 then)
+        const int32_t max = ctx_server.prefix_pins_max;
+        props["prefix_pins"] = {
+            {"enabled",     max > 0},
+            {"max",         max},
+            {"used",        ctx_server.prefix_pins_used.load()},
+            {"max_tokens",  ctx_server.prefix_pins_max_tokens.load()},
+            {"used_tokens", ctx_server.prefix_pins_used_tokens.load()},
+        };
+        res->ok(props);
         return res;
+    };
+
+    this->get_prefixes = [this](const server_http_req & req) {
+        return handle_prefix_task(req, server_task(SERVER_TASK_TYPE_PREFIX_LIST), 200);
+    };
+
+    this->post_prefixes = [this](const server_http_req & req) {
+        server_task task(SERVER_TASK_TYPE_PREFIX_CREATE);
+        if (ctx_server.prefix_pins_max > 0) {
+            const json body = json::parse(req.body);
+            const json tokens = json_value(body, "tokens", json());
+            const auto is_token_id = [](const json & t) {
+                return t.is_number_integer() && t.get<int64_t>() >= 0 && t.get<int64_t>() <= INT32_MAX;
+            };
+            if (!tokens.is_array() || !std::all_of(tokens.begin(), tokens.end(), is_token_id)) {
+                auto res = create_response();
+                res->error(format_error_response("\"tokens\" must be an array of token ids", ERROR_TYPE_PREFIX_INVALID_TOKENS));
+                return res;
+            }
+            task.prefix_action.tokens = tokens.get<llama_tokens>();
+            if (body.contains("parent") && !body.at("parent").is_null()) {
+                if (!body.at("parent").is_string()) {
+                    throw std::invalid_argument("\"parent\" must be a string");
+                }
+                task.prefix_action.parent = body.at("parent").get<std::string>();
+            }
+        }
+        return handle_prefix_task(req, std::move(task), 201);
+    };
+
+    this->delete_prefix = [this](const server_http_req & req) {
+        server_task task(SERVER_TASK_TYPE_PREFIX_DELETE);
+        task.prefix_action.id = req.get_param("id");
+        return handle_prefix_task(req, std::move(task), 204);
     };
 
     this->post_props = [this](const server_http_req &) {
@@ -5715,6 +6107,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
         return res;
     }
     return storage_op_run(std::move(res), std::move(task), req);
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_prefix_task(const server_http_req & req, server_task && task, int status_ok) {
+    auto res = create_response();
+    if (ctx_server.prefix_pins_max == 0) {
+        res->error(format_error_response("prefix pins are disabled, start the server with --prefix-pins", ERROR_TYPE_PREFIX_PINS_DISABLED));
+        return res;
+    }
+
+    task.id = res->rd.get_new_id();
+    res->rd.post_task(std::move(task));
+
+    auto result = res->rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    res->ok(result->to_json());
+    res->status = status_ok;
+    if (status_ok == 204) {
+        res->data.clear();
+    }
+    return res;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {

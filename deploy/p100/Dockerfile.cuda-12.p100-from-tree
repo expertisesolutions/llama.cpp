@@ -6,33 +6,24 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     git \
-    patch \
     libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/llama.cpp
-RUN git clone https://github.com/ggml-org/llama.cpp.git . \
-    && git fetch origin pull/27836/head \
-    && git checkout -q 1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af \
-    && git submodule update --init --recursive
-
-# Copy P100 patches plus local slot-checkpoint persistence fix (PR #26004)
-COPY patches/p100/ /opt/p100-patches/
-
-# Apply patches in order, zero fuzz, stop on first failure
-RUN for p in /opt/p100-patches/*.patch; do \
-        echo "Applying $(basename $p)..."; \
-        patch -p1 -F 0 < "$p" || { echo "FAILED: $p"; exit 1; }; \
-    done && echo "All patches applied."
+# Source tree from git archive: extract src.tar at repo root
+# ARG SOURCE_COMMIT is passed at build time to identify the source
+ARG SOURCE_COMMIT
+COPY src.tar /tmp/src.tar
+RUN tar -x -f /tmp/src.tar -C /opt/llama.cpp && rm /tmp/src.tar
 
 RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
 
 RUN cmake -S . -B build \
     -DGGML_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES=86 \
+    -DCMAKE_CUDA_ARCHITECTURES=60 \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_RPC=OFF \
+    -DGGML_RPC=ON \
     -DGGML_NATIVE=OFF \
     -DGGML_AVX=ON \
     -DGGML_AVX2=ON \
@@ -51,9 +42,12 @@ FROM docker.io/nvidia/cuda:12.2.2-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG SOURCE_COMMIT
 LABEL com.github.containers.toolbox="true" \
       usage="This image is meant to be used with the toolbox command" \
-      summary="RTX 3090 prefill: p100 chain + pr26004 + prefetch depth-N"
+      summary="Nvidia P100 llama.cpp qwen4exp MTP + P100 patches + slot checkpoints PR26004" \
+      local.source-commit=${SOURCE_COMMIT} \
+      local.source-branch=storage-operations
 
 RUN apt-get update && apt-get install -y \
     sudo \

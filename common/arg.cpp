@@ -1718,6 +1718,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--prefix-pins"}, "N",
+        string_format("max number of prefix pins kept in reserved sequences (default: %d, 0 = disabled, max 16)", params.prefix_pins),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 16) {
+                throw std::invalid_argument("prefix-pins must be between 0 and 16");
+            }
+            params.prefix_pins = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PINS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-pin-max-tokens"}, "N",
+        string_format("max total tokens retained by all pins of --prefix-pins (default: %d)", params.prefix_pin_max_tokens),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("prefix-pin-max-tokens must be positive");
+            }
+            params.prefix_pin_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_PIN_MAX_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -2971,6 +2991,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
+        }
+    ));
+    add_opt(common_arg(
+        {"-pw", "--prefetch-weights"}, "0|1",
+        string_format("prefetch weight transfers to overlap CPU->GPU copies with compute (default: %d)", (int) params.prefetch_weights),
+        [](common_params & params, int value) {
+            params.prefetch_weights = value != 0;
         }
     ));
     add_opt(common_arg(
