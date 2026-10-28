@@ -5,7 +5,7 @@ This directory holds the container recipes for the llama-server images of the P1
 ## Single source tree
 
 The source of every image is the branch `storage-operations`.
-Commit: commit X (filled in when pin/prefix-pins is merged into storage-operations).
+Commit: `6d4f166102b8a7b359242cfe45e50d482aa71f31`. The P100 judge image is built from it. It is part of `expertise-main` since the merge `9ebe65393`.
 
 The P100 image and the 3090 image compile the same tree. The recipes apply no patches: all earlier patches are commits in the branch.
 
