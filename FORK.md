@@ -31,7 +31,7 @@ This fork is public. Do not commit host names, IP addresses, credentials, or any
 2. Start new work from `expertise-main`. Use a short-lived branch (for example `fix/slot-save-error`).
 3. When the work is done and tested, merge the branch into `expertise-main` and push it to `fork`.
 4. Do not build a production server from a feature branch. Build from a commit that is already in `expertise-main`.
-5. Do not rewrite the history of `expertise-main` (no force push, no rebase of published commits). The deploy recipes pin commit IDs.
+5. Do not rewrite the history of `expertise-main` (no force push, no rebase of published commits). The deploy recipes pin commit IDs. The one exception is the Kmic rebase of 2026-10-31, see "Where we are now". It does not allow any other force push.
 6. Build and run the tests for the code you touched before you merge. For the server, run the tests in `tools/server/tests`.
 7. Keep our patches small and separate from upstream code where you can. A smaller patch conflicts less when we take a new upstream version.
 
@@ -63,18 +63,21 @@ git push fork expertise-main
 
 Merge upstream into our branch. Do not rebase our branch onto upstream.
 
-llama.cpp moves fast. On 2026-10-22 upstream `master` was 1163 commits ahead of our base. The files we change most are `tools/server/server-context.cpp`, `src/models/qwen4exp.cpp`, and the slot save and restore code. Expect conflicts there.
+llama.cpp moves fast. The files we change most are `tools/server/server-context.cpp` and the slot save and restore code. Expect conflicts there.
+
+## Where we are now
+
+On 2026-10-31 we rebased `expertise-main` on Kmic. The new base is the Kmic-68 branch `p100-optimizations`, commit `7461904d` (upstream `d327bf1f0`, b11869, 2026-10-24). Our patches are cherry-picked on top of it.
+
+- The old line of `expertise-main` is archived. It is the branch and the tag `expertise-main-pre-kmic-20261031` (commit `5ce6ae08b`).
+- The owner approved this ONE force push on 2026-10-31. The rule "do not force push" stays in force for every other case.
+- Patch 92 (`f9b76a521`) was dropped. The file it changes does not exist on Kmic.
+- The 22 shinbunbun carries and the qwen4exp commits were dropped. Kmic replaces them.
+- What we keep on top of Kmic: fail-closed handling of slot checkpoint storage errors, slot storage operations tracking and the `GET /storage-operations` endpoint, prefix pins, weight prefetch (patch 91), and the packaging recipes in `deploy/`.
 
 ## Where we started
 
-`expertise-main` was created on 2026-10-22 from the branch `storage-operations` (commit `6ed910655`). That branch is built on upstream commit `e70802a01` and carries these patch groups:
-
-- the Qwen4Exp NextN/MTP draft head (model, GGUF tensors, converter);
-- fail-closed handling of slot checkpoint storage errors;
-- slot storage operations tracking and the `GET /storage-operations` endpoint;
-- the packaging inputs for the P100 and 3090 builds.
-
-The older branch name `storage-operations` is kept only so old references still work. Do not add new work to it.
+`expertise-main` was created on 2026-10-22 from the branch `storage-operations` (commit `6ed910655`), which was built on upstream commit `e70802a01`. That is the history before the Kmic rebase. The older branch name `storage-operations` is kept only so old references still work. Do not add new work to it.
 
 ## Not included
 

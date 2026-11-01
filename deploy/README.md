@@ -4,10 +4,11 @@ This directory holds the container recipes for the llama-server images of the P1
 
 ## Single source tree
 
-The source of every image is the branch `storage-operations`.
-Commit: `6d4f166102b8a7b359242cfe45e50d482aa71f31`. The P100 judge image is built from it. It is part of `expertise-main` since the merge `9ebe65393`.
+The source of every image is the branch `expertise-main`.
+Its base is Kmic-68 `p100-optimizations`, commit `7461904d` (upstream `d327bf1f0`, b11869, 2026-10-24). Our patches sit on top of that base.
+The older branch `storage-operations` is not a build source anymore. See "Older build inputs".
 
-The P100 image and the 3090 image compile the same tree. The recipes apply no patches: all earlier patches are commits in the branch.
+The P100 image and the 3090 image compile the same tree. The recipes apply no patches: all patches are commits in the branch.
 
 The two builds differ only in build parameters:
 
@@ -15,8 +16,15 @@ The two builds differ only in build parameters:
 |---|---|---|
 | `CMAKE_CUDA_ARCHITECTURES` | 60 | 86 |
 | `GGML_RPC` | ON | OFF |
+| `GGML_CUDA_NCCL` | OFF | default |
+| `GGML_CUDA_FA_QUANTS` | all | default |
+| `LLAMA_BUILD_TESTS` | ON | ON |
 | Recipe | `deploy/p100/Dockerfile.cuda-12.p100-from-tree` | `deploy/3090/Containerfile.cuda-sm86.from-tree` |
 | Image name | `llama-p100-qwen4-mtp` | `llama-cuda-3090` |
+
+The P100 flags `GGML_CUDA_NCCL=OFF` and `GGML_CUDA_FA_QUANTS=all` are the same flags that the Kmic build uses. Both options exist in the CMake files of this tree.
+
+`LLAMA_BUILD_TESTS=ON` builds `test-backend-ops`. The recipe runs `cmake --install`, and the runtime stage copies all of `/usr/local`, so `test-backend-ops` is in `/usr/local/bin` of both images. Use it to test the CUDA kernels on the real GPU, for example `test-backend-ops test -o MUL_MAT -b CUDA0`.
 
 Both recipes use the base image `nvidia/cuda:12.2.2-devel-ubuntu22.04` for the build stage and `nvidia/cuda:12.2.2-runtime-ubuntu22.04` for the runtime stage.
 
@@ -24,7 +32,7 @@ Both recipes use the base image `nvidia/cuda:12.2.2-devel-ubuntu22.04` for the b
 
 Each build starts in a new, empty build directory. The recipe reads the source from a file named `src.tar` in the build context.
 
-1. Make sure that the commit you want is the tip of `storage-operations` in your llama.cpp checkout. Write down its full SHA.
+1. Make sure that the commit you want is the tip of `expertise-main` in your llama.cpp checkout. Write down its full SHA.
 2. Create the new build directory and the target directory (`p100` or `3090`) inside it.
 3. Export the tree with `git archive`, without a `.git` directory:
 
@@ -35,9 +43,9 @@ Each build starts in a new, empty build directory. The recipe reads the source f
 
        timeout --signal=TERM --kill-after=120s 6h podman build --layers \
          --label local.source-commit=<full-sha> \
-         --label local.source-branch=storage-operations \
+         --label local.source-branch=expertise-main \
          --iidfile <new-build-dir>/<target>.iid \
-         -t localhost/<image>:storage-operations-<shortsha> \
+         -t localhost/<image>:expertise-main-<shortsha> \
          -f <new-build-dir>/<target>/<recipe> <new-build-dir>/<target>
 
 The label `local.source-commit` is the build identity of the image. The build context has no `.git` directory, so `llama-server --version` and the `build_info` field print "unknown". Read the label to find the commit:
@@ -48,10 +56,10 @@ The label `local.source-commit` is the build identity of the image. The build co
 
 | Host | Image in use | Status |
 |---|---|---|
-| P100 | built from the single source tree | follows the commit above |
-| 3090 | `llama-cuda-3090:storage-operations-6ed910655` | pending |
+| P100 | TBD after the Kmic rollout | TBD after the Kmic rollout |
+| 3090 | TBD after the Kmic rollout | TBD after the Kmic rollout |
 
-3090: pending. It still runs `llama-cuda-3090:storage-operations-6ed910655`. It must be rebuilt from the same commit with `deploy/3090/Containerfile.cuda-sm86.from-tree`. No build and no restart of the 3090 was done in the work that added prefix pins.
+This table is filled in when the images built from the Kmic base are in use on the hosts.
 
 ## Judge instance parameters (P100)
 
@@ -73,4 +81,4 @@ Measurements that need the real model on the P100 test GPU (latency, hit rate, e
 
 ## Older build inputs
 
-`deploy/storage-operations/` keeps the history of earlier builds. See `deploy/storage-operations/README.md`.
+Before the Kmic base, the images were built from the branch `storage-operations`. `deploy/storage-operations/` keeps the history of those builds. See `deploy/storage-operations/README.md`.

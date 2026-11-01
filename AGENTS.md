@@ -1,6 +1,6 @@
 # Instructions for llama.cpp
 
-> **Expertise fork:** this repository is our fork. The official branch is `expertise-main` (the role `master` has upstream). Every change we run must be merged into it. Read [FORK.md](FORK.md) before you branch, merge, or build a server.
+> **Expertise fork:** this repository is our fork. The official branch is `expertise-main` (the role `master` has upstream). Every change we run must be merged into it. Read [FORK.md](FORK.md) before you branch, merge, or build a server. Since 2026-10-31 its base is Kmic-68 `p100-optimizations` `7461904d` (upstream `d327bf1f0`, b11869). The old line is archived at `expertise-main-pre-kmic-20261031`. That one force push was approved by the owner. Otherwise never force push `expertise-main`.
 
 > [!IMPORTANT]
 >

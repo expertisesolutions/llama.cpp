@@ -30,6 +30,9 @@ RUN cmake -S . -B build \
     -DGGML_FMA=ON \
     -DGGML_F16C=ON \
     -DGGML_AVX512=OFF \
+    -DGGML_CUDA_NCCL=OFF \
+    -DGGML_CUDA_FA_QUANTS=all \
+    -DLLAMA_BUILD_TESTS=ON \
     && cmake --build build --config Release -j$(nproc) \
     && cmake --install build --config Release
 
@@ -45,9 +48,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG SOURCE_COMMIT
 LABEL com.github.containers.toolbox="true" \
       usage="This image is meant to be used with the toolbox command" \
-      summary="Nvidia P100 llama.cpp qwen4exp MTP + P100 patches + slot checkpoints PR26004" \
+      summary="Nvidia P100 llama.cpp on Kmic p100-optimizations + expertise-main patches" \
       local.source-commit=${SOURCE_COMMIT} \
-      local.source-branch=storage-operations
+      local.source-branch=expertise-main
 
 RUN apt-get update && apt-get install -y \
     sudo \
