@@ -58,11 +58,16 @@ All rows run images of the same commit `eb5d302ac` (Kmic base plus the kept patc
 
 | Host | Image in use | Status |
 |---|---|---|
-| P100 Qwen (8081/8082/8083) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | 8081 in container `llama-p100-qwen`; 8082/8083 in `llama-p100-kmic-eb5d302ac` |
+| P100 Qwen (8081/8082/8083) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | container `llama-p100-qwen` (all three ports) |
 | 3090 prefill (9101) | `localhost/llama-cuda-3090:expertise-main-eb5d302ac` | container `llama-3090-prefill` |
-| P100 judge (8183/8185/8187) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | container `llama-p100-single-kmic-eb5d302ac` |
+| P100 judge (8183/8185/8187) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | container `llama-p100-judge` |
 
-The 3090 also runs with the runtime workarounds `LLAMA_KQ_MASK_COMPACT=0` and `GGML_CUDA_GDN_GATHER=0` (Kmic bugs not fixed in this commit); the P100 containers run without them.
+The older containers `llama-p100-kmic-eb5d302ac` and `llama-p100-single-kmic-eb5d302ac` are not running anymore.
+
+The 3090 also runs with two runtime workarounds for Kmic bugs not fixed in this commit; the P100 containers run without them:
+
+- `GGML_CUDA_GDN_GATHER=0` avoids an illegal memory access (Xid 13/31/43) in the Kmic GDN state-gather near 166K tokens, until the fork takes Kmic 72a97be54.
+- `LLAMA_KQ_MASK_COMPACT=0` avoids the compact KQ mask over-read on non-Pascal GPUs (Kmic 9f7b27a8f).
 
 ## Judge instance parameters (P100)
 
@@ -80,7 +85,11 @@ Creating a pin prefills it in one call that cannot be cancelled and blocks the s
 
 See "Prefix pins" in `tools/server/README.md` for the flags, the startup rules, and the HTTP API.
 
-Measurements that need the real model on the P100 test GPU (latency, hit rate, equivalence of results) are to be measured (tasks 9 and 10).
+Measured context per instance (KV f16, one slot):
+
+- 8081: 4 P100, `-sm layer`, `-c 573440`.
+- 8082 and 8083: 2 P100 each, `-sm tensor` with `GGML_CUDA_P2P=1`, `-c 215040`.
+- judges 8183/8185/8187: Q2_K model, one P100 each, `-c 32768`.
 
 ## Older build inputs
 
