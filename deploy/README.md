@@ -54,12 +54,15 @@ The label `local.source-commit` is the build identity of the image. The build co
 
 ## Hardware status
 
+All rows run images of the same commit `eb5d302ac` (Kmic base plus the kept patches; see "Single source tree" above).
+
 | Host | Image in use | Status |
 |---|---|---|
-| P100 | TBD after the Kmic rollout | TBD after the Kmic rollout |
-| 3090 | TBD after the Kmic rollout | TBD after the Kmic rollout |
+| P100 Qwen (8081/8082/8083) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | 8081 in container `llama-p100-qwen`; 8082/8083 in `llama-p100-kmic-eb5d302ac` |
+| 3090 prefill (9101) | `localhost/llama-cuda-3090:expertise-main-eb5d302ac` | container `llama-3090-prefill` |
+| P100 judge (8183/8185/8187) | `localhost/llama-p100-qwen4-mtp:expertise-main-eb5d302ac` | container `llama-p100-single-kmic-eb5d302ac` |
 
-This table is filled in when the images built from the Kmic base are in use on the hosts.
+The 3090 also runs with the runtime workarounds `LLAMA_KQ_MASK_COMPACT=0` and `GGML_CUDA_GDN_GATHER=0` (Kmic bugs not fixed in this commit); the P100 containers run without them.
 
 ## Judge instance parameters (P100)
 
