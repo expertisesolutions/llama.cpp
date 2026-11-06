@@ -423,6 +423,12 @@ void llama_file::sync_close() {
     llama_file_sync_close(fp);
 }
 
+void llama_file::flush_close() {
+    FILE * fp = pimpl->fp;
+    pimpl->fp = nullptr;
+    llama_file_flush_close(fp);
+}
+
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
