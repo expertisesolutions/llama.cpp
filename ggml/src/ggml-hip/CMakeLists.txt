@@ -61,6 +61,8 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# NVIDIA-only sources: cuBLAS/driver-API GEMM paths and sm_60 inline asm (their headers stub them out under HIP).
+list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX ".*/(fattn-gemm|gemm-fold|gdn-chunked|mmvq-f16)\\.cu$")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")

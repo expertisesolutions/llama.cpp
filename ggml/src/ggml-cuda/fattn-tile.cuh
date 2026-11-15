@@ -1123,7 +1123,10 @@ static __global__ void flash_attn_tile(
     static_assert(cpw == 1 || np == 1, "bad cpw / np");
     static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
 
-#ifdef FAST_FP16_AVAILABLE
+// HIP compiles each kernel twice. The host pass has no RDNA/CDNA macro, so get_config falls to the
+// warp-64 table (np == 2 for DKQ 128/256) for a body that never runs there. Check np where the code
+// runs: the device pass, which selects the real table (RDNA: np == 1).
+#if defined(FAST_FP16_AVAILABLE) && (!defined(GGML_USE_HIP) || defined(__HIP_DEVICE_COMPILE__))
     // The np > 1 cross-warp combine below stages and reduces VKQ, which the per-tile fp32 fold
     // zeroes on every iteration, and never touches VKQ_f -- so with np > 1 it would emit ~1/np
     // of the correct numerator against a correct denominator. Every row of the fp16 config
@@ -1132,7 +1135,7 @@ static __global__ void flash_attn_tile(
     static_assert(np == 1,
         "fp16 tile path: the np > 1 combine reduces VKQ, which the per-tile fp32 fold zeroes. "
         "Fold VKQ_f in the combine before allowing nwarps > ncols here.");
-#endif // FAST_FP16_AVAILABLE
+#endif // defined(FAST_FP16_AVAILABLE) && (!defined(GGML_USE_HIP) || defined(__HIP_DEVICE_COMPILE__))
 
     constexpr int DKQp = (DKQ + 2*warp_size - 1) & ~(2*warp_size - 1); // DKQ padded to multiple of 2*warp_size.
     constexpr int DVp  = (DV  + 2*warp_size - 1) & ~(2*warp_size - 1); // DV  padded to multiple of 2*warp_size.

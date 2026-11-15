@@ -437,6 +437,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_idx, s_row, stream);
         }
     } else {
+#if !defined(GGML_USE_HIP) // gdn-chunked.cu is NVIDIA-only (excluded in ggml-hip/CMakeLists.txt)
         if (S_v == 128) {
             const ggml_cuda_gdn_alt_args a = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 H, n_tokens, n_seqs, neqk1, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
@@ -445,6 +446,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 return;
             }
         }
+#endif // !defined(GGML_USE_HIP)
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,

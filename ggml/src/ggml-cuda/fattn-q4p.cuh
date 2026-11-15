@@ -203,7 +203,11 @@ static __device__ __forceinline__ uint32_t fattn_q4p_ld16(const char * p) {
 }
 
 static __device__ __forceinline__ void fattn_q4p_prefetch_l2(const void * p) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(p); // PTX only; ggml_cuda_fattn_q4p_supported() never selects this kernel on AMD
+#else
     asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+#endif // defined(GGML_USE_HIP)
 }
 
 // dimension of PV element j for dim-group dg (see fattn_q4p_cfg::DPT)
