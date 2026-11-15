@@ -3204,7 +3204,7 @@ private:
             ckpt_write_buf(ofs, cur.data_spec, n_written);
             info.push_back({ cur.n_tokens, cur.pos_min, cur.pos_max, offset + n_start, n_written - n_start });
         }
-        llama_file_sync_close(file.release());
+        llama_file_flush_close(file.release());
         SLT_INF(slot, "appended %u context checkpoint(s) (%.3f MiB) to '%s'\n",
                 count, (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
@@ -3305,7 +3305,7 @@ private:
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write_buf(ofs, data_dft,  n_written);
         ckpt_write_buf(ofs, data_spec, n_written);
-        llama_file_sync_close(file.release());
+        llama_file_flush_close(file.release());
         SLT_INF(slot, "appended the draft state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
         return true;
     }
@@ -3584,7 +3584,7 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
+                    const size_t nwrite = llama_state_seq_save_file_cache(
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
