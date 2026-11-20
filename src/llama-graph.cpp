@@ -31,13 +31,14 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        bool allow_compact = true) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     // compact causal mask: I32 [n_tokens] of kept-prefix lengths (llama_kv_cache::kq_mask_prefix)
-    if (cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn)) {
+    if (allow_compact && cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn)) {
         ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_tokens, 1, 1, 1);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
@@ -67,9 +68,8 @@ static bool can_reuse_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     const bool compact = cparams.flash_attn && n_stream == 1 && mctx->kq_mask_compact(ubatch, cparams.causal_attn);
-    if (compact || kq_mask->type == GGML_TYPE_I32) {
-        return compact && kq_mask->type == GGML_TYPE_I32 && kq_mask->ne[0] == n_tokens &&
-               kq_mask->op_params[0] == (int32_t) n_kv;
+    if (kq_mask->type == GGML_TYPE_I32) {
+        return compact && kq_mask->ne[0] == n_tokens && kq_mask->op_params[0] == (int32_t) n_kv;
     }
 
     bool res = true;
@@ -3206,9 +3206,10 @@ ggml_tensor * llm_graph_context::build_attn(
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
-    const llama_hparams & hparams,
-    const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * mctx_cur,
+        bool allow_compact = true) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3218,7 +3219,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, allow_compact);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -4043,7 +4044,8 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(
+            ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), arch != LLM_ARCH_QWEN4EXP);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
