@@ -744,6 +744,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
+    ggml_build_forward_expand(gf, inp->new_pool_idxs);
     // one view for all layers: each view of a host input is a separate upload
     inp->new_pool_flat = ggml_reshape_1d(ctx0, inp->new_pool_idxs, kpool*inp->n_new);
     // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
