@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y \
     && dpkg -i cuda-keyring_1.1-1_all.deb \
     && rm cuda-keyring_1.1-1_all.deb \
     && apt-get update \
-    && apt-get install -y libnccl-dev \
+    && apt-get install -y \
+        libnccl2=2.19.3-1+cuda12.2 \
+        libnccl-dev=2.19.3-1+cuda12.2 \
     && cp /usr/include/nccl.h /usr/local/include/ \
     && cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* /usr/local/lib/ \
     && rm -rf /var/lib/apt/lists/*
