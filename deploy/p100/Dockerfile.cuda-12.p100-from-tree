@@ -33,6 +33,7 @@ RUN cmake -S . -B build \
     -DGGML_CUDA_NCCL=OFF \
     -DGGML_CUDA_FA_QUANTS=all \
     -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_UI=OFF \
     && cmake --build build --config Release -j$(nproc) \
     && cmake --install build --config Release
 
