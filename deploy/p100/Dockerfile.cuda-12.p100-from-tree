@@ -7,6 +7,14 @@ RUN apt-get update && apt-get install -y \
     cmake \
     git \
     libcurl4-openssl-dev \
+    wget \
+    && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y nvidia-nccl-cu12-dev \
+    && cp /usr/include/nccl.h /usr/local/include/ \
+    && cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* /usr/local/lib/ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/llama.cpp
@@ -30,7 +38,8 @@ RUN cmake -S . -B build \
     -DGGML_FMA=ON \
     -DGGML_F16C=ON \
     -DGGML_AVX512=OFF \
-    -DGGML_CUDA_NCCL=OFF \
+    -DGGML_CUDA_NCCL=ON \
+    -DNCCL_ROOT=/usr/local \
     -DGGML_CUDA_FA_QUANTS=all \
     -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_UI=OFF \
