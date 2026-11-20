@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     && dpkg -i cuda-keyring_1.1-1_all.deb \
     && rm cuda-keyring_1.1-1_all.deb \
     && apt-get update \
-    && apt-get install -y nvidia-nccl-cu12-dev \
+    && apt-get install -y libnccl-dev \
     && cp /usr/include/nccl.h /usr/local/include/ \
     && cp -a /usr/lib/x86_64-linux-gnu/libnccl.so* /usr/local/lib/ \
     && rm -rf /var/lib/apt/lists/*
