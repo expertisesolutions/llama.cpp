@@ -2,6 +2,16 @@
 
 #include "common.cuh"
 
+#if defined(GGML_USE_HIP)
+#define MMVQ_F16_MAX_COLS 16
+
+// Pascal-only (NVIDIA sm_60) path, not built for HIP (mmvq-f16.cu is excluded in ggml-hip/CMakeLists.txt).
+static inline bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int64_t) { return false; }
+static inline bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, ggml_tensor *, int64_t) { return false; }
+static inline bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *, int64_t) { return false; }
+static inline bool ggml_cuda_mmvq_f16_takes(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t) { return false; }
+static inline void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context &) {}
+#else // !defined(GGML_USE_HIP)
 #define MMVQ_F16_MAX_COLS 16 // widest batch the fp16 path takes (several parallel sequences' verify)
 
 // fp16 multi-column q6_K matvec for Pascal (MTP verify widths). Returns false if it does not handle
@@ -28,3 +38,4 @@ bool ggml_cuda_mmvq_f16_takes(const ggml_tensor * src0, const ggml_tensor * src1
 
 // Forget the cached fp16 activation (called at the start of every graph compute, like the q8_1 cache).
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx);
+#endif // defined(GGML_USE_HIP)

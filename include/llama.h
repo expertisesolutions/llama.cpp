@@ -912,6 +912,14 @@ extern "C" {
                const llama_token * tokens,
                           size_t   n_token_count);
 
+    // Like llama_state_seq_save_file, but flushes and closes without waiting for durable storage.
+    LLAMA_API size_t llama_state_seq_save_file_cache(
+            struct llama_context * ctx,
+                      const char * filepath,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
     // If tokens_out is NULL, only the token count is reported through n_token_count_out and no state is loaded
     LLAMA_API size_t llama_state_seq_load_file(
             struct llama_context * ctx,

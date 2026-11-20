@@ -2,6 +2,18 @@
 
 #include "common.cuh"
 
+#if defined(GGML_USE_HIP)
+// Pascal-only (NVIDIA sm_60) path, not built for HIP (gemm-fold.cu is excluded in ggml-hip/CMakeLists.txt).
+// The dispatcher sees "not handled" and takes its normal route.
+static inline bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { return false; }
+static inline bool ggml_cuda_gemm_fold_wants_f32(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *) { return false; }
+static inline void ggml_cuda_gemm_fold_set_partner(ggml_tensor *) {}
+static inline bool ggml_cuda_gemm_fold_take_partner_done() { return false; }
+static inline void ggml_cuda_gemm_fold_prefetch(ggml_backend_cuda_context &) {}
+static inline bool ggml_cuda_gemm_fold_glu_ok(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *) { return false; }
+static inline void ggml_cuda_gemm_fold_set_glu(const ggml_tensor *) {}
+static inline bool ggml_cuda_gemm_fold_glu_pending() { return false; }
+#else // !defined(GGML_USE_HIP)
 // Prefill GEMM for Pascal: fp16 HFMA2 products with short fp16 chains folded into fp32 accumulators.
 // Replaces cuBLAS COMPUTE_16F (whole-K fp16 accumulation) for quantized/f16 weights x f32
 // activations. Returns false if it does not handle the shape. See gemm-fold.cu.
@@ -34,3 +46,4 @@ void ggml_cuda_gemm_fold_prefetch(ggml_backend_cuda_context & ctx);
 bool ggml_cuda_gemm_fold_glu_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm);
 void ggml_cuda_gemm_fold_set_glu(const ggml_tensor * glu);
 bool ggml_cuda_gemm_fold_glu_pending();
+#endif // defined(GGML_USE_HIP)

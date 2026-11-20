@@ -188,7 +188,8 @@ struct llama_context {
           llama_seq_id   seq_id,
             const char * filepath,
      const llama_token * tokens,
-                size_t   n_token_count);
+                size_t   n_token_count,
+                  bool   durable = true);
 
     //
     // perf
