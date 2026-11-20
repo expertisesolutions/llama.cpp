@@ -1,0 +1,45 @@
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    ninja-build \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/llama.cpp
+# Source tree from git archive: extract src.tar at repo root.
+ARG SOURCE_COMMIT
+ARG SOURCE_BRANCH=expertise-main
+ARG BUILD_JOBS=8
+COPY src.tar /tmp/src.tar
+RUN tar -x -f /tmp/src.tar -C /opt/llama.cpp && rm /tmp/src.tar
+
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+    cmake -S . -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=ON \
+    -DGPU_TARGETS=gfx1100 \
+    -DGGML_RPC=OFF \
+    -DGGML_NATIVE=OFF \
+    -DGGML_AVX=ON \
+    -DGGML_AVX2=ON \
+    -DGGML_FMA=ON \
+    -DGGML_F16C=ON \
+    -DGGML_AVX512=OFF \
+    -DLLAMA_BUILD_TESTS=OFF \
+    && cmake --build build -j${BUILD_JOBS} \
+    && cmake --install build --prefix /usr/local
+
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf \
+    && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+    && ldconfig
+
+LABEL summary="RX 7900 XTX HIP gfx1100 from the expertise-main source tree" \
+      local.source-commit=${SOURCE_COMMIT} \
+      local.source-branch=${SOURCE_BRANCH}
+
+CMD ["/bin/bash"]

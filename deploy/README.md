@@ -1,6 +1,6 @@
 # Deploy recipes
 
-This directory holds the container recipes for the llama-server images of the P100 and the RTX 3090 hosts.
+This directory holds container recipes for the llama-server images of the P100, RTX 3090, and RX 7900 XTX hosts.
 
 ## Single source tree
 
@@ -28,22 +28,29 @@ The P100 flags `GGML_CUDA_NCCL=OFF` and `GGML_CUDA_FA_QUANTS=all` are the same f
 
 Both recipes use the base image `nvidia/cuda:12.2.2-devel-ubuntu22.04` for the build stage and `nvidia/cuda:12.2.2-runtime-ubuntu22.04` for the runtime stage.
 
+## RX 7900 XTX (ROCm gfx1100)
+
+`deploy/xtx/Containerfile.rocm-gfx1100.from-tree` builds an RX 7900 XTX image from the same `expertise-main` source archive as the CUDA recipes. It uses `rocm/dev-ubuntu-24.04:7.2.4-complete`, HIP, Ninja, and `GPU_TARGETS=gfx1100`. Pass the full source SHA with `--build-arg SOURCE_COMMIT=<full-sha>`; the recipe defaults `SOURCE_BRANCH` to `expertise-main` and records both values in `local.source-*` labels.
+
+The XTX image deployed before this recipe was ported is historical evidence only: its `local.source-commit` label is `28c20ad0d`. Commit `245b1259` includes the HIP source compatibility carried from that image. Future XTX builds must archive a selected `expertise-main` commit and use this recipe; they are not builds from `storage-operations`.
+
 ## Build
 
 Each build starts in a new, empty build directory. The recipe reads the source from a file named `src.tar` in the build context.
 
 1. Make sure that the commit you want is the tip of `expertise-main` in your llama.cpp checkout. Write down its full SHA.
-2. Create the new build directory and the target directory (`p100` or `3090`) inside it.
+2. Create the new build directory and the target directory (`p100`, `3090`, or `xtx`) inside it.
 3. Export the tree with `git archive`, without a `.git` directory:
 
        git archive <full-sha> > <new-build-dir>/<target>/src.tar
 
 4. Copy the recipe for the target into `<new-build-dir>/<target>/`.
-5. Run the build:
+5. Run the build. For XTX, set `SOURCE_COMMIT` explicitly; the recipe records the branch label itself:
 
        timeout --signal=TERM --kill-after=120s 6h podman build --layers \
          --label local.source-commit=<full-sha> \
          --label local.source-branch=expertise-main \
+         --build-arg SOURCE_COMMIT=<full-sha> \
          --iidfile <new-build-dir>/<target>.iid \
          -t localhost/<image>:expertise-main-<shortsha> \
          -f <new-build-dir>/<target>/<recipe> <new-build-dir>/<target>
